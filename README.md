@@ -1,6 +1,9 @@
-# Distributed Key-Value Store with Raft Consensus
+# RaftLabKV: Distributed Key-Value Store with Raft Consensus
 
 A simple distributed key-value store implementation using the Raft consensus algorithm, similar to etcd but simplified for educational purposes.
+
+> Developed using Claude Code and Codex.
+> Not recommended for production use.
 
 ## Architecture
 
