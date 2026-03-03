@@ -9,25 +9,32 @@ import (
 	"github.com/harshithgowda/distributed-key-value-store/pkg/raft"
 )
 
+// Server is the HTTP server that handles both raft messages and KV API
+// requests. It has a single /raft/message endpoint for all raft communication,
+// plus /kv/get/{key}, /kv/put, /kv/delete/{key}, and /status endpoints.
 type Server struct {
-	raft  *raft.Node
+	node  raft.Node
 	store *kvstore.KVStore
 	addr  string
 }
 
-func NewServer(raftNode *raft.Node, store *kvstore.KVStore, addr string) *Server {
+// NewServer creates a new HTTP server.
+func NewServer(node raft.Node, store *kvstore.KVStore, addr string) *Server {
 	return &Server{
-		raft:  raftNode,
+		node:  node,
 		store: store,
 		addr:  addr,
 	}
 }
 
+// Start starts the HTTP server. It blocks until the server exits.
 func (s *Server) Start() error {
 	mux := http.NewServeMux()
-	
-	mux.HandleFunc("/raft/requestVote", s.handleRequestVote)
-	mux.HandleFunc("/raft/appendEntries", s.handleAppendEntries)
+
+	// Raft message endpoint - all raft RPCs are Message structs.
+	mux.Handle("/raft/message", Handler(s.node))
+
+	// KV API endpoints.
 	mux.HandleFunc("/kv/get/", s.handleGet)
 	mux.HandleFunc("/kv/put", s.handlePut)
 	mux.HandleFunc("/kv/delete/", s.handleDelete)
@@ -36,42 +43,6 @@ func (s *Server) Start() error {
 
 	log.Printf("Starting server on %s", s.addr)
 	return http.ListenAndServe(s.addr, mux)
-}
-
-func (s *Server) handleRequestVote(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var args raft.RequestVoteArgs
-	if err := json.NewDecoder(r.Body).Decode(&args); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	reply := s.raft.RequestVote(&args)
-	
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(reply)
-}
-
-func (s *Server) handleAppendEntries(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var args raft.AppendEntriesArgs
-	if err := json.NewDecoder(r.Body).Decode(&args); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	reply := s.raft.AppendEntries(&args)
-	
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(reply)
 }
 
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
@@ -167,12 +138,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	term, isLeader := s.raft.GetState()
-	status := map[string]interface{}{
-		"term":     term,
-		"isLeader": isLeader,
-	}
-
+	status := s.node.Status()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(status)
 }

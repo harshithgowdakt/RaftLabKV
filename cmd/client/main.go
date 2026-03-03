@@ -13,6 +13,7 @@ import (
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Println("Usage: client <server1,server2,server3>")
+		fmt.Println("Example: client localhost:8080,localhost:8081,localhost:8082")
 		os.Exit(1)
 	}
 
@@ -20,7 +21,7 @@ func main() {
 	kvClient := client.NewClient(servers)
 
 	scanner := bufio.NewScanner(os.Stdin)
-	
+
 	fmt.Println("Distributed Key-Value Store Client")
 	fmt.Println("Commands: get <key>, put <key> <value>, delete <key>, getall, status <server>, exit")
 
@@ -48,7 +49,7 @@ func main() {
 				fmt.Println("Usage: get <key>")
 				continue
 			}
-			
+
 			value, err := kvClient.Get(parts[1])
 			if err != nil {
 				fmt.Printf("Error: %v\n", err)
@@ -61,7 +62,7 @@ func main() {
 				fmt.Println("Usage: put <key> <value>")
 				continue
 			}
-			
+
 			err := kvClient.Put(parts[1], parts[2])
 			if err != nil {
 				fmt.Printf("Error: %v\n", err)
@@ -74,7 +75,7 @@ func main() {
 				fmt.Println("Usage: delete <key>")
 				continue
 			}
-			
+
 			err := kvClient.Delete(parts[1])
 			if err != nil {
 				fmt.Printf("Error: %v\n", err)
@@ -101,7 +102,7 @@ func main() {
 				fmt.Println("Usage: status <server>")
 				continue
 			}
-			
+
 			status, err := kvClient.GetStatus(parts[1])
 			if err != nil {
 				fmt.Printf("Error: %v\n", err)

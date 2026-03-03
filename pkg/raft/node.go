@@ -1,201 +1,323 @@
 package raft
 
-import (
-	"log"
-	"math/rand"
-	"time"
-)
+import "context"
 
-func NewNode(id string, peers []string, transport Transport) *Node {
-	n := &Node{
-		id:               id,
-		peers:            peers,
-		state:            Follower,
-		currentTerm:      0,
-		votedFor:         "",
-		log:              make([]LogEntry, 0),
-		commitIndex:      -1,
-		lastApplied:      -1,
-		nextIndex:        make(map[string]int),
-		matchIndex:       make(map[string]int),
-		electionTimeout:  time.Duration(150+rand.Intn(150)) * time.Millisecond,
-		heartbeatTimeout: 50 * time.Millisecond,
-		lastHeartbeat:    time.Now(),
-		applyCh:          make(chan LogEntry, 100),
-		stopCh:           make(chan struct{}),
-		transport:        transport,
+// Node represents a node in a raft cluster. It is the primary interface
+// for the application to interact with the raft state machine.
+type Node interface {
+	// Tick increments the internal logical clock for the Node by a single tick.
+	// Election timeouts and heartbeat timeouts are measured in ticks.
+	Tick()
+
+	// Campaign causes the Node to transition to candidate state and start
+	// campaigning to become leader.
+	Campaign(ctx context.Context) error
+
+	// Propose proposes that data be appended to the log. Proposals can be
+	// lost without notice, therefore it is user's job to ensure proposal
+	// retries.
+	Propose(ctx context.Context, data []byte) error
+
+	// Step advances the state machine using the given message. ctx.Err()
+	// will be returned, if any.
+	Step(ctx context.Context, msg Message) error
+
+	// Ready returns a channel that receives Ready structs when the Node has
+	// state to process.
+	Ready() <-chan Ready
+
+	// Advance notifies the Node that the application has saved progress
+	// up to the last Ready. It prepares the node to return the next
+	// available Ready.
+	Advance()
+
+	// ReadIndex requests a read state. The read state will be set in the
+	// Ready. Read state has a read index.
+	ReadIndex(ctx context.Context, rctx []byte) error
+
+	// Status returns the current status of the raft state machine.
+	Status() Status
+
+	// ReportUnreachable reports the given node is not reachable for the
+	// last send.
+	ReportUnreachable(id uint64)
+
+	// ReportSnapshot reports the status of the sent snapshot.
+	ReportSnapshot(id uint64, status SnapshotStatus)
+
+	// Stop performs any necessary termination of the Node.
+	Stop()
+}
+
+type msgWithResult struct {
+	m      Message
+	result chan error
+}
+
+// node implements the Node interface. It multiplexes raft state machine
+// operations through channels and runs a select loop in a goroutine.
+type node struct {
+	propc    chan msgWithResult
+	recvc    chan Message
+	readyc   chan Ready
+	advancec chan struct{}
+	tickc    chan struct{}
+	done     chan struct{}
+	stop     chan struct{}
+	status   chan chan Status
+
+	rn *RawNode
+}
+
+func newNode(rn *RawNode) node {
+	return node{
+		propc:    make(chan msgWithResult),
+		recvc:    make(chan Message),
+		readyc:   make(chan Ready),
+		advancec: make(chan struct{}),
+		tickc:    make(chan struct{}, 128),
+		done:     make(chan struct{}),
+		stop:     make(chan struct{}),
+		status:   make(chan chan Status),
+		rn:       rn,
 	}
-
-	for _, peer := range peers {
-		n.nextIndex[peer] = 0
-		n.matchIndex[peer] = -1
-	}
-
-	return n
 }
 
-func (n *Node) Start() {
-	go n.electionLoop()
-	go n.heartbeatLoop()
-}
+// run is the main event loop for the node. It multiplexes all inputs
+// (proposals, messages, ticks) and outputs (Ready) through channels.
+func (n *node) run() {
+	var (
+		propc    chan msgWithResult
+		readyc   chan Ready
+		advancec chan struct{}
+		rd       Ready
+	)
 
-func (n *Node) Stop() {
-	close(n.stopCh)
-}
+	r := n.rn.raft
 
-func (n *Node) GetState() (int, bool) {
-	n.mu.RLock()
-	defer n.mu.RUnlock()
-	return n.currentTerm, n.state == Leader
-}
+	lead := None
 
-func (n *Node) GetApplyCh() <-chan LogEntry {
-	return n.applyCh
-}
-
-func (n *Node) Submit(command interface{}) bool {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	if n.state != Leader {
-		return false
-	}
-
-	entry := LogEntry{
-		Index:   len(n.log),
-		Term:    n.currentTerm,
-		Command: command,
-	}
-
-	n.log = append(n.log, entry)
-	log.Printf("Node %s: Added entry %+v", n.id, entry)
-
-	go n.replicateToFollowers()
-	return true
-}
-
-func (n *Node) electionLoop() {
 	for {
-		select {
-		case <-n.stopCh:
-			return
-		default:
-			n.mu.RLock()
-			state := n.state
-			lastHeartbeat := n.lastHeartbeat
-			electionTimeout := n.electionTimeout
-			n.mu.RUnlock()
+		if advancec != nil {
+			// We're waiting for the application to call Advance.
+			readyc = nil
+		} else if n.rn.HasReady() {
+			rd = n.rn.Ready()
+			readyc = n.readyc
+		} else {
+			readyc = nil
+		}
 
-			if state != Leader && time.Since(lastHeartbeat) > electionTimeout {
-				n.startElection()
+		// Only accept proposals if we know there's a leader.
+		if lead != r.lead {
+			if r.hasLeader() {
+				propc = n.propc
+			} else {
+				propc = nil
 			}
-			time.Sleep(10 * time.Millisecond)
+			lead = r.lead
+		}
+
+		select {
+		case pm := <-propc:
+			m := pm.m
+			m.From = r.id
+			err := r.Step(m)
+			if pm.result != nil {
+				pm.result <- err
+				close(pm.result)
+			}
+		case m := <-n.recvc:
+			_ = r.Step(m)
+		case <-n.tickc:
+			n.rn.Tick()
+		case readyc <- rd:
+			advancec = n.advancec
+		case <-advancec:
+			n.rn.Advance(rd)
+			rd = Ready{}
+			advancec = nil
+		case c := <-n.status:
+			c <- getStatus(r)
+		case <-n.stop:
+			close(n.done)
+			return
 		}
 	}
 }
 
-func (n *Node) heartbeatLoop() {
-	for {
-		select {
-		case <-n.stopCh:
-			return
-		default:
-			n.mu.RLock()
-			state := n.state
-			n.mu.RUnlock()
+// Tick implements the Node interface.
+func (n *node) Tick() {
+	select {
+	case n.tickc <- struct{}{}:
+	case <-n.done:
+	default:
+		// Tick channel is full; a tick was dropped.
+	}
+}
 
-			if state == Leader {
-				n.sendHeartbeats()
-			}
-			time.Sleep(n.heartbeatTimeout)
+// Campaign implements the Node interface.
+func (n *node) Campaign(ctx context.Context) error {
+	return n.step(ctx, Message{Type: MsgHup})
+}
+
+// Propose implements the Node interface.
+func (n *node) Propose(ctx context.Context, data []byte) error {
+	return n.stepWait(ctx, Message{
+		Type:    MsgProp,
+		Entries: []Entry{{Data: data}},
+	})
+}
+
+// Step implements the Node interface.
+func (n *node) Step(ctx context.Context, m Message) error {
+	// Ignore unexpected local messages.
+	if IsLocalMsg(m.Type) {
+		return nil
+	}
+	return n.step(ctx, m)
+}
+
+func (n *node) step(ctx context.Context, m Message) error {
+	return n.stepWithWaitOption(ctx, m, false)
+}
+
+func (n *node) stepWait(ctx context.Context, m Message) error {
+	return n.stepWithWaitOption(ctx, m, true)
+}
+
+func (n *node) stepWithWaitOption(ctx context.Context, m Message, wait bool) error {
+	if m.Type != MsgProp {
+		select {
+		case n.recvc <- m:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-n.done:
+			return ErrStopped
 		}
 	}
-}
 
-
-func (n *Node) becomeFollower(term int) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	n.state = Follower
-	n.currentTerm = term
-	n.votedFor = ""
-	n.lastHeartbeat = time.Now()
-	log.Printf("Node %s: Became follower for term %d", n.id, term)
-}
-
-func (n *Node) becomeCandidate() {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	n.state = Candidate
-	n.currentTerm++
-	n.votedFor = n.id
-	n.lastHeartbeat = time.Now()
-	n.electionTimeout = time.Duration(150+rand.Intn(150)) * time.Millisecond
-	log.Printf("Node %s: Became candidate for term %d", n.id, n.currentTerm)
-}
-
-func (n *Node) becomeLeader() {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	n.state = Leader
-	for peer := range n.nextIndex {
-		n.nextIndex[peer] = len(n.log)
-		n.matchIndex[peer] = -1
+	ch := n.propc
+	pm := msgWithResult{m: m}
+	if wait {
+		pm.result = make(chan error, 1)
 	}
-	log.Printf("Node %s: Became leader for term %d", n.id, n.currentTerm)
-}
-
-func (n *Node) resetElectionTimeout() {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	n.lastHeartbeat = time.Now()
-}
-
-func (n *Node) getLastLogInfo() (int, int) {
-	if len(n.log) == 0 {
-		return -1, 0
+	select {
+	case ch <- pm:
+		if !wait {
+			return nil
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-n.done:
+		return ErrStopped
 	}
-	lastEntry := n.log[len(n.log)-1]
-	return lastEntry.Index, lastEntry.Term
+
+	select {
+	case err := <-pm.result:
+		if err != nil {
+			return err
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-n.done:
+		return ErrStopped
+	}
+	return nil
 }
 
-func (n *Node) updateCommitIndex() {
-	n.mu.Lock()
-	defer n.mu.Unlock()
+// Ready implements the Node interface.
+func (n *node) Ready() <-chan Ready {
+	return n.readyc
+}
 
-	if n.state != Leader {
+// Advance implements the Node interface.
+func (n *node) Advance() {
+	select {
+	case n.advancec <- struct{}{}:
+	case <-n.done:
+	}
+}
+
+// ReadIndex implements the Node interface.
+func (n *node) ReadIndex(ctx context.Context, rctx []byte) error {
+	return n.step(ctx, Message{
+		Type:    MsgReadIndex,
+		Entries: []Entry{{Data: rctx}},
+	})
+}
+
+// Status implements the Node interface.
+func (n *node) Status() Status {
+	c := make(chan Status)
+	select {
+	case n.status <- c:
+		return <-c
+	case <-n.done:
+		return Status{}
+	}
+}
+
+// ReportUnreachable implements the Node interface.
+func (n *node) ReportUnreachable(id uint64) {
+	select {
+	case n.recvc <- Message{Type: MsgUnreachable, From: id}:
+	case <-n.done:
+	}
+}
+
+// ReportSnapshot implements the Node interface.
+func (n *node) ReportSnapshot(id uint64, status SnapshotStatus) {
+	rej := status == SnapshotFailure
+	select {
+	case n.recvc <- Message{Type: MsgSnapStatus, From: id, Reject: rej}:
+	case <-n.done:
+	}
+}
+
+// Stop implements the Node interface.
+func (n *node) Stop() {
+	select {
+	case n.stop <- struct{}{}:
+		// Not already stopped, so trigger it.
+	case <-n.done:
+		// Node has already been stopped - no need to do anything.
 		return
 	}
-
-	for i := n.commitIndex + 1; i < len(n.log); i++ {
-		if n.log[i].Term != n.currentTerm {
-			continue
-		}
-
-		count := 1
-		for peer := range n.matchIndex {
-			if n.matchIndex[peer] >= i {
-				count++
-			}
-		}
-
-		if count > len(n.peers)/2 {
-			n.commitIndex = i
-			n.applyEntries()
-		}
-	}
+	// Block until the stop has been acknowledged by run().
+	<-n.done
 }
 
-func (n *Node) applyEntries() {
-	for n.lastApplied < n.commitIndex {
-		n.lastApplied++
-		entry := n.log[n.lastApplied]
-		select {
-		case n.applyCh <- entry:
-		default:
-		}
+// ErrStopped is returned by methods after a Node has been stopped.
+var ErrStopped = errorf("raft: stopped")
+
+// StartNode returns a new Node given configuration and a list of raft peers.
+// It appends a ConfChange entry for each given peer to the initial log.
+func StartNode(c *Config, peers []Peer) Node {
+	rn, err := NewRawNode(c)
+	if err != nil {
+		panic(err)
 	}
+	if err := rn.Bootstrap(peers); err != nil {
+		panic(err)
+	}
+
+	n := newNode(rn)
+	go n.run()
+	return &n
+}
+
+// RestartNode returns a new Node restored from previous state saved in
+// Storage. It does NOT call Bootstrap; the caller must ensure that Storage
+// already contains the state from a previous run.
+func RestartNode(c *Config) Node {
+	rn, err := NewRawNode(c)
+	if err != nil {
+		panic(err)
+	}
+
+	n := newNode(rn)
+	go n.run()
+	return &n
 }
