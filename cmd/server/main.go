@@ -18,6 +18,7 @@ import (
 	"github.com/harshithgowda/distributed-key-value-store/pkg/raft"
 	"github.com/harshithgowda/distributed-key-value-store/pkg/snap"
 	"github.com/harshithgowda/distributed-key-value-store/pkg/wal"
+	"github.com/harshithgowda/distributed-key-value-store/pkg/wal/walpb"
 )
 
 const snapshotInterval uint64 = 10000
@@ -96,18 +97,21 @@ func main() {
 
 		// 1. Load latest snapshot from disk.
 		var snapshot *raft.Snapshot
-		snapLocator := wal.SnapshotLocator{}
+		walSnap := &walpb.Snapshot{} // default: index=0, term=0
 		snapshot, err := snapshotter.Load()
 		if err != nil {
 			log.Printf("No snapshot found: %v", err)
 		} else {
 			log.Printf("Loaded snapshot at term=%d index=%d", snapshot.Metadata.Term, snapshot.Metadata.Index)
-			snapLocator = wal.SnapshotLocator{Term: snapshot.Metadata.Term, Index: snapshot.Metadata.Index}
+			walSnap = &walpb.Snapshot{
+				Term:  snapshot.Metadata.Term,
+				Index: snapshot.Metadata.Index,
+			}
 			snapIndex = snapshot.Metadata.Index
 		}
 
 		// 2. Open WAL from snapshot point.
-		w, err = wal.Open(walDir, snapLocator)
+		w, err = wal.Open(walDir, walSnap)
 		if err != nil {
 			log.Fatalf("Failed to open WAL: %v", err)
 		}
@@ -143,8 +147,7 @@ func main() {
 		// 7. Restart raft node.
 		node = raft.RestartNode(cfg)
 
-		// 8. Open bbolt KV store (it already has data from before crash;
-		//    if snapshot was received, RestoreSnapshot will be called in the loop).
+		// 8. Open bbolt KV store.
 		store, err = kvstore.NewKVStore(dbPath, node)
 		if err != nil {
 			log.Fatalf("Failed to open KV store: %v", err)
@@ -212,12 +215,13 @@ func main() {
 
 			// 2. Handle snapshot if any.
 			if !raft.IsEmptySnap(rd.Snapshot) {
-				// Save snapshot marker in WAL.
-				sl := wal.SnapshotLocator{
+				walSnap := &walpb.Snapshot{
 					Term:  rd.Snapshot.Metadata.Term,
 					Index: rd.Snapshot.Metadata.Index,
 				}
-				if err := w.SaveSnapshot(sl); err != nil {
+
+				// Save snapshot marker in WAL.
+				if err := w.SaveSnapshot(walSnap); err != nil {
 					log.Fatalf("Failed to save snapshot to WAL: %v", err)
 				}
 
@@ -273,13 +277,15 @@ func main() {
 						if err := snapshotter.SaveSnap(compactSnap); err != nil {
 							log.Printf("Failed to save snapshot: %v", err)
 						} else {
-							sl := wal.SnapshotLocator{
+							walSnap := &walpb.Snapshot{
 								Term:  compactSnap.Metadata.Term,
 								Index: compactSnap.Metadata.Index,
 							}
-							if err := w.SaveSnapshot(sl); err != nil {
+							if err := w.SaveSnapshot(walSnap); err != nil {
 								log.Printf("Failed to save snapshot to WAL: %v", err)
 							}
+							// Release old WAL segment locks.
+							w.ReleaseLockTo(lastApplied)
 							if err := storage.Compact(lastApplied); err != nil {
 								log.Printf("Failed to compact storage: %v", err)
 							}

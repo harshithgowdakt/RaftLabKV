@@ -1,280 +1,354 @@
+// Package wal implements a write-ahead log modeled after etcd's WAL.
+//
+// The WAL is a sequence of binary segment files in a directory. Each
+// segment contains framed protobuf records with CRC-32C integrity.
+//
+// Record types:
+//
+//	MetadataType (1) — cluster/member metadata
+//	EntryType    (2) — raft log entries
+//	StateType    (3) — raft hard state
+//	CrcType      (4) — CRC chain continuation at segment boundaries
+//	SnapshotType (5) — snapshot marker (term + index)
+//
+// Segment files are pre-allocated to 64 MB and named with 16-hex-char
+// sequence and index numbers: {seq:016x}-{index:016x}.wal
 package wal
 
 import (
-	"bufio"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"hash"
-	"hash/crc32"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 
+	"github.com/harshithgowda/distributed-key-value-store/pkg/fileutil"
 	"github.com/harshithgowda/distributed-key-value-store/pkg/raft"
+	"github.com/harshithgowda/distributed-key-value-store/pkg/wal/walpb"
+	"google.golang.org/protobuf/proto"
 )
 
-// Record types stored in the WAL.
+// Record types (1-indexed, matching etcd).
 const (
-	recTypeMetadata      int64 = 0 // WAL metadata (e.g., node ID)
-	recTypeEntry         int64 = 1 // JSON-encoded raft.Entry
-	recTypeState         int64 = 2 // JSON-encoded raft.HardState
-	recTypeCRC           int64 = 3 // CRC chain sentinel (segment continuity)
-	recTypeSnapshotIndex int64 = 4 // snapshot marker {term, index}
+	MetadataType int64 = iota + 1 // 1
+	EntryType                      // 2
+	StateType                      // 3
+	CrcType                        // 4
+	SnapshotType                   // 5
 )
 
-const (
-	segmentSizeBytes = 64 * 1024 * 1024 // 64 MB
-	recordAlign      = 8                 // 8-byte alignment for records
-)
+// SegmentSizeBytes is the target size for WAL segments. When a segment
+// exceeds this after a Save, it is rotated.
+var SegmentSizeBytes int64 = 64 * 1000 * 1000 // 64 MB (etcd uses 64*1000*1000)
 
-// SnapshotLocator identifies a snapshot boundary in the WAL.
-type SnapshotLocator struct {
-	Term  uint64 `json:"term"`
-	Index uint64 `json:"index"`
-}
-
-// WAL implements a binary segmented write-ahead log with CRC integrity.
-//
-// Record format:
-//
-//	[type: 8 bytes LE (int64)][crc32: 4 bytes LE][dataLen: 4 bytes LE][data: dataLen bytes][padding: 0-7 bytes to 8-byte align]
+// WAL is a write-ahead log with binary segmented files, CRC integrity,
+// file locking, pre-allocation, and a background file pipeline.
 type WAL struct {
-	mu      sync.Mutex
-	dir     string
-	file    *os.File    // current segment file
-	seq     uint64      // current segment sequence number
-	encoder *walEncoder // buffered binary record writer
-	crc     hash.Hash32 // running CRC (IEEE)
+	mu sync.Mutex
+
+	dir      string
+	dirFile  *os.File               // open handle on dir for fsync
+	metadata []byte                 // cluster/member metadata
+	state    raft.HardState         // latest hard state (written at segment rotation)
+	start    *walpb.Snapshot        // snapshot the WAL was opened from
+	locks    []*fileutil.LockedFile // locked segment files (oldest first)
+	fp       *filePipeline          // background pre-allocation
+
+	encoder *encoder // current segment encoder
 }
 
-// Exists returns true if the directory contains any .wal segment files.
+// Exists returns true if dir contains .wal files.
 func Exists(dir string) bool {
-	entries, err := os.ReadDir(dir)
+	names, err := fileutil.ReadDir(dir)
 	if err != nil {
 		return false
 	}
-	for _, e := range entries {
-		if strings.HasSuffix(e.Name(), ".wal") {
+	for _, name := range names {
+		if strings.HasSuffix(name, ".wal") {
 			return true
 		}
 	}
 	return false
 }
 
-// Create initializes a new WAL in the given directory, writing an initial
-// segment with metadata and CRC sentinel records. Used for new clusters.
+// Create initializes a new WAL in dir. It creates the directory, writes
+// the first segment with metadata and an initial snapshot record
+// (index=0, term=0), and starts the file pipeline.
 func Create(dir string, metadata []byte) (*WAL, error) {
-	if err := os.MkdirAll(dir, 0750); err != nil {
-		return nil, fmt.Errorf("wal: mkdir: %w", err)
+	if Exists(dir) {
+		return nil, fmt.Errorf("wal: directory %s already contains WAL files", dir)
 	}
 
-	// Create first segment: seq=0, index=0
-	fname := segmentName(0, 0)
-	fpath := filepath.Join(dir, fname)
+	// Create a temporary directory, write the first segment there,
+	// then rename atomically.
+	tmpdirpath := filepath.Clean(dir) + ".tmp"
+	if err := fileutil.CreateDirAll(tmpdirpath); err != nil {
+		return nil, err
+	}
 
-	f, err := os.Create(fpath)
+	// Create first segment file.
+	fpath := filepath.Join(tmpdirpath, walName(0, 0))
+	f, err := fileutil.LockFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, fileutil.PrivateFileMode)
 	if err != nil {
-		return nil, fmt.Errorf("wal: create segment: %w", err)
+		os.RemoveAll(tmpdirpath)
+		return nil, err
+	}
+	// Pre-allocate.
+	if err := fileutil.Preallocate(f.File, SegmentSizeBytes); err != nil {
+		f.Close()
+		os.RemoveAll(tmpdirpath)
+		return nil, err
+	}
+	// Seek to beginning for writing.
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		f.Close()
+		os.RemoveAll(tmpdirpath)
+		return nil, err
 	}
 
 	w := &WAL{
-		dir:  dir,
-		file: f,
-		seq:  0,
-		crc:  crc32.NewIEEE(),
+		dir:      dir,
+		metadata: metadata,
 	}
-	w.encoder = newWalEncoder(f, w.crc)
+	enc := newFileEncoder(f.File, 0)
+	w.encoder = enc
+	w.locks = append(w.locks, f)
 
 	// Write metadata record.
-	if err := w.encoder.encode(recTypeMetadata, metadata); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("wal: write metadata: %w", err)
+	if err := w.saveMeta(MetadataType, metadata); err != nil {
+		w.cleanupTmp(tmpdirpath)
+		return nil, err
+	}
+	// Write initial snapshot record (index=0, term=0) — establishes
+	// the invariant that all entries are preceded by a snapshot.
+	if err := w.SaveSnapshot(&walpb.Snapshot{}); err != nil {
+		w.cleanupTmp(tmpdirpath)
+		return nil, err
 	}
 
-	// Write initial CRC sentinel.
-	if err := w.encoder.encode(recTypeCRC, nil); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("wal: write crc sentinel: %w", err)
+	// Rename temp dir to final dir atomically.
+	if err := os.Rename(tmpdirpath, dir); err != nil {
+		w.cleanupTmp(tmpdirpath)
+		return nil, err
+	}
+	// Fsync parent directory.
+	if err := fileutil.Fsync(filepath.Dir(dir)); err != nil {
+		return nil, err
 	}
 
-	if err := w.encoder.flush(); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("wal: flush: %w", err)
+	// Re-open the file with the final path for the lock.
+	newPath := filepath.Join(dir, walName(0, 0))
+	newF, err := fileutil.LockFile(newPath, os.O_WRONLY|os.O_APPEND, fileutil.PrivateFileMode)
+	if err != nil {
+		return nil, err
 	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("wal: sync: %w", err)
+	// Close the old locked file (it was in tmp dir).
+	w.locks[0].Close()
+	w.locks[0] = newF
+
+	// Repoint encoder to the new file.
+	w.encoder = newFileEncoder(newF.File, 0)
+	// Replay to bring encoder CRC up to date by re-reading what we wrote.
+	w.encoder = newFileEncoder(newF.File, 0)
+	// Actually, since the encoder was writing sequentially and we reopened,
+	// we need to seek to end and create a fresh encoder at the right offset.
+	off, err := newF.Seek(0, io.SeekEnd)
+	if err != nil {
+		return nil, err
+	}
+	w.encoder = newEncoder(newF.File, 0, int(off)%walPageBytes)
+
+	// Open directory handle.
+	w.dirFile, err = os.Open(dir)
+	if err != nil {
+		return nil, err
 	}
 
-	// Fsync directory.
-	if err := syncDir(dir); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("wal: sync dir: %w", err)
-	}
+	// Start file pipeline.
+	w.fp = newFilePipeline(dir, SegmentSizeBytes)
 
 	return w, nil
 }
 
-// Open opens an existing WAL for recovery. It locates segments starting
-// from the given snapshot point and prepares for appending.
-func Open(dir string, snap SnapshotLocator) (*WAL, error) {
-	names, err := segmentNames(dir)
+// Open opens an existing WAL for recovery/appending. The snap parameter
+// indicates the snapshot point; only segments from that point onward
+// will be opened. After Open, call ReadAll to recover state, which
+// transitions the WAL from read mode to append mode.
+func Open(dir string, snap *walpb.Snapshot) (*WAL, error) {
+	w, err := openAtIndex(dir, snap)
+	if err != nil {
+		return nil, err
+	}
+	return w, nil
+}
+
+func openAtIndex(dir string, snap *walpb.Snapshot) (*WAL, error) {
+	names, err := readWALNames(dir)
 	if err != nil {
 		return nil, err
 	}
 	if len(names) == 0 {
-		return nil, fmt.Errorf("wal: no segments found in %s", dir)
+		return nil, fmt.Errorf("wal: no segment files in %s", dir)
 	}
 
-	// Open the last segment for appending.
-	lastSeg := names[len(names)-1]
-	lastSeq, _, _ := parseSegmentName(lastSeg)
-
-	fpath := filepath.Join(dir, lastSeg)
-	f, err := os.OpenFile(fpath, os.O_RDWR|os.O_APPEND, 0640)
+	// Find the segment containing the snapshot index.
+	nameIdx, err := searchIndex(names, snap.Index)
 	if err != nil {
-		return nil, fmt.Errorf("wal: open last segment: %w", err)
+		return nil, err
+	}
+
+	// Open and lock all segments from nameIdx onward.
+	var locks []*fileutil.LockedFile
+	for _, name := range names[nameIdx:] {
+		fpath := filepath.Join(dir, name)
+		lf, err := fileutil.TryLockFile(fpath, os.O_RDWR, fileutil.PrivateFileMode)
+		if err != nil {
+			for _, l := range locks {
+				l.Close()
+			}
+			return nil, fmt.Errorf("wal: lock %s: %w", name, err)
+		}
+		locks = append(locks, lf)
+	}
+
+	dirFile, err := os.Open(dir)
+	if err != nil {
+		for _, l := range locks {
+			l.Close()
+		}
+		return nil, err
 	}
 
 	w := &WAL{
-		dir:  dir,
-		file: f,
-		seq:  lastSeq,
-		crc:  crc32.NewIEEE(),
+		dir:     dir,
+		dirFile: dirFile,
+		start:   snap,
+		locks:   locks,
 	}
-
-	// Read all segments to reconstruct running CRC.
-	for i := 0; i < len(names); i++ {
-		segPath := filepath.Join(dir, names[i])
-		if err := w.replayCRC(segPath); err != nil {
-			f.Close()
-			return nil, fmt.Errorf("wal: replay crc %s: %w", names[i], err)
-		}
-	}
-
-	w.encoder = newWalEncoder(f, w.crc)
 	return w, nil
 }
 
-// replayCRC reads through a segment to bring the running CRC up to date.
-func (w *WAL) replayCRC(path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	dec := newWalDecoder(f)
-	for {
-		_, data, err := dec.decode()
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			break
-		}
-		if err != nil {
-			// Tolerate truncated final record.
-			break
-		}
-		// Update running CRC with the data.
-		if len(data) > 0 {
-			w.crc.Write(data)
-		}
-	}
-	return nil
-}
-
-// ReadAll reads all WAL segments and returns the metadata, hard state,
-// and entries after the snapshot index. Used during recovery.
+// ReadAll reads all WAL segments from the snapshot point onward. It
+// returns metadata, the latest hard state, and all raft entries.
+// After reading, it transitions to append mode by creating an encoder
+// on the last segment and starting the file pipeline.
 func (w *WAL) ReadAll() ([]byte, raft.HardState, []raft.Entry, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	names, err := segmentNames(w.dir)
-	if err != nil {
-		return nil, raft.HardState{}, nil, err
+	// Build readers from all locked segments.
+	readers := make([]io.Reader, len(w.locks))
+	for i, lf := range w.locks {
+		if _, err := lf.Seek(0, io.SeekStart); err != nil {
+			return nil, raft.HardState{}, nil, err
+		}
+		readers[i] = lf.File
 	}
+
+	dec := newDecoder(readers...)
 
 	var (
 		metadata []byte
 		hs       raft.HardState
 		entries  []raft.Entry
+		matchSn  bool // have we found the matching snapshot record?
 	)
 
-	for _, name := range names {
-		segPath := filepath.Join(w.dir, name)
-		meta, state, ents, err := w.readSegment(segPath)
-		if err != nil {
-			return nil, raft.HardState{}, nil, fmt.Errorf("wal: read segment %s: %w", name, err)
-		}
-		if meta != nil {
-			metadata = meta
-		}
-		if !raft.IsEmptyHardState(state) {
-			hs = state
-		}
-		entries = append(entries, ents...)
-	}
-
-	return metadata, hs, entries, nil
-}
-
-func (w *WAL) readSegment(path string) ([]byte, raft.HardState, []raft.Entry, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, raft.HardState{}, nil, err
-	}
-	defer f.Close()
-
-	dec := newWalDecoder(f)
-	var (
-		metadata []byte
-		hs       raft.HardState
-		entries  []raft.Entry
-	)
-
+	var rec walpb.Record
 	for {
-		recType, data, err := dec.decode()
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
+		err := dec.decode(&rec)
+		if err == io.EOF {
+			break
+		}
+		if err == io.ErrUnexpectedEOF {
+			// Torn write in the last segment — zero it out for repair.
+			log.Printf("wal: torn write detected, zeroing from offset %d", dec.lastOffset())
+			lastFile := w.locks[len(w.locks)-1]
+			if err := fileutil.ZeroToEnd(lastFile.File, dec.lastOffset()); err != nil {
+				return nil, raft.HardState{}, nil, fmt.Errorf("wal: zero torn: %w", err)
+			}
 			break
 		}
 		if err != nil {
-			// Truncated final record — log warning and stop.
-			log.Printf("wal: truncated record in %s, stopping read", filepath.Base(path))
-			break
+			return nil, raft.HardState{}, nil, err
 		}
 
-		switch recType {
-		case recTypeMetadata:
-			metadata = data
-		case recTypeEntry:
+		switch rec.Type {
+		case MetadataType:
+			if metadata != nil && string(metadata) != string(rec.Data) {
+				return nil, raft.HardState{}, nil, fmt.Errorf("wal: metadata conflict")
+			}
+			metadata = rec.Data
+
+		case CrcType:
+			// Re-seed CRC chain from previous segment.
+			crc := dec.lastCRC()
+			dec.updateCRC(crc)
+
+		case SnapshotType:
+			var snap walpb.Snapshot
+			if err := proto.Unmarshal(rec.Data, &snap); err != nil {
+				return nil, raft.HardState{}, nil, fmt.Errorf("wal: unmarshal snap: %w", err)
+			}
+			if w.start != nil && snap.Index == w.start.Index && snap.Term == w.start.Term {
+				matchSn = true
+			}
+
+		case EntryType:
 			var e raft.Entry
-			if err := json.Unmarshal(data, &e); err != nil {
-				return nil, raft.HardState{}, nil, fmt.Errorf("unmarshal entry: %w", err)
+			if err := json.Unmarshal(rec.Data, &e); err != nil {
+				return nil, raft.HardState{}, nil, fmt.Errorf("wal: unmarshal entry: %w", err)
 			}
-			entries = append(entries, e)
-		case recTypeState:
-			if err := json.Unmarshal(data, &hs); err != nil {
-				return nil, raft.HardState{}, nil, fmt.Errorf("unmarshal state: %w", err)
+			// Last-write-wins: if index already in slice, replace.
+			if len(entries) > 0 && e.Index == entries[len(entries)-1].Index {
+				entries[len(entries)-1] = e
+			} else {
+				entries = append(entries, e)
 			}
-		case recTypeCRC:
-			// CRC sentinel — used for segment continuity, skip.
-		case recTypeSnapshotIndex:
-			// Snapshot marker — informational, skip.
+
+		case StateType:
+			if err := json.Unmarshal(rec.Data, &hs); err != nil {
+				return nil, raft.HardState{}, nil, fmt.Errorf("wal: unmarshal state: %w", err)
+			}
+			w.state = hs
+
 		default:
-			log.Printf("wal: unknown record type %d in %s", recType, filepath.Base(path))
+			log.Printf("wal: unknown record type %d", rec.Type)
 		}
 	}
+
+	// Validate that we found the starting snapshot.
+	if !matchSn && w.start != nil && (w.start.Index > 0 || w.start.Term > 0) {
+		return nil, raft.HardState{}, nil, fmt.Errorf("wal: snapshot record not found for index=%d term=%d", w.start.Index, w.start.Term)
+	}
+
+	w.metadata = metadata
+
+	// --- Transition to append mode ---
+
+	// Close read-only file handles except the last one (which we'll write to).
+	lastLock := w.locks[len(w.locks)-1]
+
+	// Seek to the end of valid data in the last segment.
+	if _, err := lastLock.Seek(dec.lastOffset(), io.SeekStart); err != nil {
+		return nil, raft.HardState{}, nil, err
+	}
+
+	// Create encoder on the last segment, seeded with the decoder's CRC.
+	w.encoder = newFileEncoder(lastLock.File, dec.lastCRC())
+
+	// Start file pipeline for future segments.
+	w.fp = newFilePipeline(w.dir, SegmentSizeBytes)
 
 	return metadata, hs, entries, nil
 }
 
-// Save persists the given hard state and entries to the WAL.
-// All entry records are written first, then the state record, followed
-// by a flush and fsync. Segment rotation is checked after writing.
+// Save persists hard state and entries. Entries are written first, then
+// the state record, followed by a flush + fsync. Triggers segment
+// rotation if the current segment exceeds SegmentSizeBytes.
 func (w *WAL) Save(st raft.HardState, ents []raft.Entry) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -285,54 +359,104 @@ func (w *WAL) Save(st raft.HardState, ents []raft.Entry) error {
 		if err != nil {
 			return fmt.Errorf("wal: marshal entry: %w", err)
 		}
-		if err := w.encoder.encode(recTypeEntry, data); err != nil {
+		rec := &walpb.Record{Type: EntryType, Data: data}
+		if err := w.encoder.encode(rec); err != nil {
 			return fmt.Errorf("wal: encode entry: %w", err)
 		}
 	}
 
-	// Write hard state record if non-empty.
+	// Write hard state if non-empty.
 	if !raft.IsEmptyHardState(st) {
 		data, err := json.Marshal(st)
 		if err != nil {
 			return fmt.Errorf("wal: marshal state: %w", err)
 		}
-		if err := w.encoder.encode(recTypeState, data); err != nil {
+		rec := &walpb.Record{Type: StateType, Data: data}
+		if err := w.encoder.encode(rec); err != nil {
 			return fmt.Errorf("wal: encode state: %w", err)
 		}
+		w.state = st
 	}
 
 	// Flush and fsync.
 	if err := w.encoder.flush(); err != nil {
 		return fmt.Errorf("wal: flush: %w", err)
 	}
-	if err := w.file.Sync(); err != nil {
+	curFile := w.locks[len(w.locks)-1]
+	if err := curFile.Sync(); err != nil {
 		return fmt.Errorf("wal: sync: %w", err)
 	}
 
-	// Check if segment rotation is needed.
-	return w.maybeRotate()
+	// Check segment rotation.
+	info, err := curFile.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Size() < SegmentSizeBytes {
+		return nil
+	}
+	return w.cut()
 }
 
-// SaveSnapshot writes a snapshot marker record to the WAL.
-func (w *WAL) SaveSnapshot(snap SnapshotLocator) error {
+// SaveSnapshot writes a snapshot marker to the WAL.
+func (w *WAL) SaveSnapshot(snap *walpb.Snapshot) error {
+	data, err := proto.Marshal(snap)
+	if err != nil {
+		return err
+	}
+	rec := &walpb.Record{Type: SnapshotType, Data: data}
+	if err := w.encoder.encode(rec); err != nil {
+		return err
+	}
+	// Flush + sync to ensure the snapshot marker is durable before
+	// we tell the snapshotter to write the actual snapshot file.
+	if err := w.encoder.flush(); err != nil {
+		return err
+	}
+	if len(w.locks) > 0 {
+		curFile := w.locks[len(w.locks)-1]
+		return curFile.Sync()
+	}
+	return nil
+}
+
+// ReleaseLockTo releases file locks on segments whose entries are all
+// before the given index. Keeps the largest segment lock below the
+// threshold to avoid gaps. This allows the purge goroutine to delete
+// old segment files.
+func (w *WAL) ReleaseLockTo(index uint64) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	data, err := json.Marshal(snap)
-	if err != nil {
-		return fmt.Errorf("wal: marshal snap locator: %w", err)
+	if len(w.locks) <= 1 {
+		return nil
 	}
 
-	if err := w.encoder.encode(recTypeSnapshotIndex, data); err != nil {
-		return fmt.Errorf("wal: encode snap: %w", err)
+	// Find the last lock to release. We keep at least one lock below
+	// the threshold and always keep the current (last) segment.
+	var toRelease int
+	for i, lf := range w.locks[:len(w.locks)-1] {
+		_, segIndex, err := parseWalName(filepath.Base(lf.Name()))
+		if err != nil {
+			continue
+		}
+		if segIndex >= index {
+			break
+		}
+		toRelease = i
 	}
-	if err := w.encoder.flush(); err != nil {
-		return fmt.Errorf("wal: flush: %w", err)
+
+	// Release locks [0, toRelease).
+	for i := 0; i < toRelease; i++ {
+		if err := w.locks[i].Close(); err != nil {
+			log.Printf("wal: release lock: %v", err)
+		}
 	}
-	return w.file.Sync()
+	w.locks = w.locks[toRelease:]
+	return nil
 }
 
-// Close closes the current WAL segment file.
+// Close flushes, closes all segment files, and shuts down the pipeline.
 func (w *WAL) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -340,220 +464,154 @@ func (w *WAL) Close() error {
 	if w.encoder != nil {
 		w.encoder.flush()
 	}
-	if w.file != nil {
-		return w.file.Close()
+	if w.fp != nil {
+		w.fp.Close()
+	}
+	for _, lf := range w.locks {
+		lf.Close()
+	}
+	w.locks = nil
+	if w.dirFile != nil {
+		w.dirFile.Close()
 	}
 	return nil
 }
 
-// maybeRotate checks if the current segment exceeds the size limit and
-// rotates to a new segment if needed.
-func (w *WAL) maybeRotate() error {
-	info, err := w.file.Stat()
-	if err != nil {
-		return err
-	}
-	if info.Size() < segmentSizeBytes {
-		return nil
-	}
-	return w.rotate()
-}
-
-// rotate creates a new segment file and writes a CRC sentinel for continuity.
-func (w *WAL) rotate() error {
+// cut rotates to a new segment. The new segment starts with a CRC record
+// (chaining from previous segment), a metadata record, and a state record.
+func (w *WAL) cut() error {
 	// Flush and sync current segment.
 	if err := w.encoder.flush(); err != nil {
 		return err
 	}
-	if err := w.file.Sync(); err != nil {
+	curFile := w.locks[len(w.locks)-1]
+
+	// Truncate current segment to actual written size (reclaim pre-allocated space).
+	off, err := curFile.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+	if err := curFile.Truncate(off); err != nil {
+		return err
+	}
+	if err := curFile.Sync(); err != nil {
 		return err
 	}
 
-	w.seq++
-	fname := segmentName(w.seq, 0)
-	fpath := filepath.Join(w.dir, fname)
-
-	f, err := os.Create(fpath)
+	// Get a pre-allocated file from the pipeline.
+	newFile, err := w.fp.Open()
 	if err != nil {
-		return fmt.Errorf("wal: create new segment: %w", err)
+		return fmt.Errorf("wal: pipeline open: %w", err)
 	}
 
-	// Close old segment.
-	w.file.Close()
-	w.file = f
-	w.encoder = newWalEncoder(f, w.crc)
+	// Determine new segment name. Use last entry index if available.
+	_, lastIdx := w.lastEntryInfo()
+	newSeq := w.currentSeq() + 1
+	newName := walName(newSeq, lastIdx+1)
+	newPath := filepath.Join(w.dir, newName)
 
-	// Write CRC sentinel carrying the running CRC from the previous segment.
-	crcVal := w.crc.Sum32()
-	var crcData [4]byte
-	binary.LittleEndian.PutUint32(crcData[:], crcVal)
-	if err := w.encoder.encode(recTypeCRC, crcData[:]); err != nil {
-		return fmt.Errorf("wal: write crc sentinel: %w", err)
+	// Seek to beginning of the new file.
+	if _, err := newFile.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+
+	// Create encoder on the new file, chaining CRC.
+	w.encoder = newFileEncoder(newFile.File, w.encoder.crc.Sum32())
+
+	// Write CRC record to chain integrity.
+	if err := w.saveCRC(w.encoder.crc.Sum32()); err != nil {
+		return err
+	}
+	// Write metadata record.
+	if err := w.saveMeta(MetadataType, w.metadata); err != nil {
+		return err
+	}
+	// Write current hard state.
+	if !raft.IsEmptyHardState(w.state) {
+		stateData, err := json.Marshal(w.state)
+		if err != nil {
+			return err
+		}
+		rec := &walpb.Record{Type: StateType, Data: stateData}
+		if err := w.encoder.encode(rec); err != nil {
+			return err
+		}
 	}
 	if err := w.encoder.flush(); err != nil {
 		return err
 	}
-	if err := f.Sync(); err != nil {
+
+	// Rename temp file to final WAL name.
+	if err := os.Rename(newFile.Name(), newPath); err != nil {
+		return err
+	}
+	if err := fileutil.Fsync(w.dir); err != nil {
 		return err
 	}
 
-	return syncDir(w.dir)
-}
-
-// --- walEncoder ---
-
-// walEncoder writes binary WAL records with buffering.
-type walEncoder struct {
-	bw  *bufio.Writer
-	crc hash.Hash32
-}
-
-func newWalEncoder(w io.Writer, crc hash.Hash32) *walEncoder {
-	return &walEncoder{
-		bw:  bufio.NewWriterSize(w, 128*1024),
-		crc: crc,
+	// Close the old pipeline file and re-open with lock under the new name.
+	newFile.Close()
+	newLF, err := fileutil.TryLockFile(newPath, os.O_WRONLY|os.O_APPEND, fileutil.PrivateFileMode)
+	if err != nil {
+		return fmt.Errorf("wal: lock new segment: %w", err)
 	}
-}
+	w.locks = append(w.locks, newLF)
 
-// encode writes a single WAL record:
-// [type: 8 bytes LE][crc32: 4 bytes LE][dataLen: 4 bytes LE][data][padding to 8-byte align]
-func (enc *walEncoder) encode(recType int64, data []byte) error {
-	// Update running CRC with the data.
-	if len(data) > 0 {
-		enc.crc.Write(data)
-	}
-	checksum := enc.crc.Sum32()
-
-	// Write header: type(8) + crc(4) + dataLen(4) = 16 bytes.
-	var header [16]byte
-	binary.LittleEndian.PutUint64(header[0:8], uint64(recType))
-	binary.LittleEndian.PutUint32(header[8:12], checksum)
-	binary.LittleEndian.PutUint32(header[12:16], uint32(len(data)))
-
-	if _, err := enc.bw.Write(header[:]); err != nil {
-		return err
-	}
-
-	// Write data.
-	if len(data) > 0 {
-		if _, err := enc.bw.Write(data); err != nil {
-			return err
-		}
-	}
-
-	// Padding to 8-byte alignment.
-	total := 16 + len(data)
-	if pad := paddingLen(total); pad > 0 {
-		var zeros [7]byte
-		if _, err := enc.bw.Write(zeros[:pad]); err != nil {
-			return err
-		}
-	}
+	// Repoint encoder to the new locked file.
+	endOff, _ := newLF.Seek(0, io.SeekEnd)
+	w.encoder = newEncoder(newLF.File, w.encoder.crc.Sum32(), int(endOff)%walPageBytes)
 
 	return nil
 }
 
-func (enc *walEncoder) flush() error {
-	return enc.bw.Flush()
+// --- Internal helpers ---
+
+func (w *WAL) saveMeta(recType int64, data []byte) error {
+	rec := &walpb.Record{Type: recType, Data: data}
+	return w.encoder.encode(rec)
 }
 
-// --- walDecoder ---
-
-// walDecoder reads binary WAL records.
-type walDecoder struct {
-	r io.Reader
+func (w *WAL) saveCRC(prevCrc uint32) error {
+	rec := &walpb.Record{Type: CrcType, Crc: prevCrc}
+	return w.encoder.encode(rec)
 }
 
-func newWalDecoder(r io.Reader) *walDecoder {
-	return &walDecoder{r: bufio.NewReaderSize(r, 128*1024)}
+func (w *WAL) currentSeq() uint64 {
+	if len(w.locks) == 0 {
+		return 0
+	}
+	last := w.locks[len(w.locks)-1]
+	seq, _, _ := parseWalName(filepath.Base(last.Name()))
+	return seq
 }
 
-// decode reads a single WAL record.
-// Returns io.EOF when no more records are available.
-func (dec *walDecoder) decode() (recType int64, data []byte, err error) {
-	// Read header: type(8) + crc(4) + dataLen(4) = 16 bytes.
-	var header [16]byte
-	if _, err := io.ReadFull(dec.r, header[:]); err != nil {
-		return 0, nil, err
+func (w *WAL) lastEntryInfo() (term, index uint64) {
+	// Best-effort: parse from the current segment name.
+	if len(w.locks) == 0 {
+		return 0, 0
 	}
-
-	recType = int64(binary.LittleEndian.Uint64(header[0:8]))
-	// crc32 at header[8:12] — verified via running CRC chain.
-	dataLen := binary.LittleEndian.Uint32(header[12:16])
-
-	// Read data.
-	if dataLen > 0 {
-		data = make([]byte, dataLen)
-		if _, err := io.ReadFull(dec.r, data); err != nil {
-			return 0, nil, err
-		}
-	}
-
-	// Skip padding.
-	total := 16 + int(dataLen)
-	if pad := paddingLen(total); pad > 0 {
-		var skip [7]byte
-		if _, err := io.ReadFull(dec.r, skip[:pad]); err != nil {
-			return recType, data, err
-		}
-	}
-
-	return recType, data, nil
+	last := w.locks[len(w.locks)-1]
+	_, idx, _ := parseWalName(filepath.Base(last.Name()))
+	return 0, idx
 }
 
-// --- Helpers ---
-
-func segmentName(seq, index uint64) string {
-	return fmt.Sprintf("%016x-%016x.wal", seq, index)
+func (w *WAL) cleanupTmp(dir string) {
+	for _, lf := range w.locks {
+		lf.Close()
+	}
+	os.RemoveAll(dir)
 }
 
-func parseSegmentName(name string) (seq, index uint64, err error) {
-	name = strings.TrimSuffix(name, ".wal")
-	parts := strings.SplitN(name, "-", 2)
-	if len(parts) != 2 {
-		return 0, 0, fmt.Errorf("wal: invalid segment name: %s", name)
-	}
-	if _, err := fmt.Sscanf(parts[0], "%016x", &seq); err != nil {
-		return 0, 0, err
-	}
-	if _, err := fmt.Sscanf(parts[1], "%016x", &index); err != nil {
-		return 0, 0, err
-	}
-	return seq, index, nil
-}
-
-func segmentNames(dir string) ([]string, error) {
-	entries, err := os.ReadDir(dir)
+func readWALNames(dir string) ([]string, error) {
+	names, err := fileutil.ReadDir(dir)
 	if err != nil {
 		return nil, fmt.Errorf("wal: read dir: %w", err)
 	}
-
-	var names []string
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		if strings.HasSuffix(e.Name(), ".wal") {
-			names = append(names, e.Name())
+	var walNames []string
+	for _, name := range names {
+		if strings.HasSuffix(name, ".wal") && isValidWALName(name) {
+			walNames = append(walNames, name)
 		}
 	}
-	sort.Strings(names)
-	return names, nil
-}
-
-func paddingLen(totalBytes int) int {
-	rem := totalBytes % recordAlign
-	if rem == 0 {
-		return 0
-	}
-	return recordAlign - rem
-}
-
-func syncDir(dir string) error {
-	f, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	return f.Sync()
+	return walNames, nil
 }
