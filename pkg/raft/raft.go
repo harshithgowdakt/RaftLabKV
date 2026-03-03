@@ -188,8 +188,15 @@ func (r *raft) send(m Message) {
 	}
 
 	if IsResponseMsg(m.Type) {
+		// Response messages (MsgAppResp, MsgVoteResp, MsgPreVoteResp,
+		// MsgHeartbeatResp) go to msgsAfterAppend. These may be self-
+		// directed (e.g., leader acking its own entries) and will be
+		// extracted by RawNode into stepsOnAdvance.
 		r.msgsAfterAppend = append(r.msgsAfterAppend, m)
 	} else {
+		if m.To == r.id {
+			r.logger.Panicf("non-response message should not be self-addressed when sending %s", m.Type)
+		}
 		r.msgs = append(r.msgs, m)
 	}
 }
@@ -404,6 +411,11 @@ func (r *raft) becomeLeader() {
 	r.lead = r.id
 	r.state = StateLeader
 
+	// The leader always has the most up-to-date log; transition self
+	// to Replicate state so it can immediately begin tracking.
+	pr := r.trk.Progress[r.id]
+	pr.BecomeReplicate()
+
 	// Conservatively set the pendingConfIndex to the last index in the
 	// log. There may or may not be a pending conf change at that index,
 	// but if there is, we don't want to allow another one.
@@ -419,19 +431,21 @@ func (r *raft) becomeLeader() {
 	r.logger.Infof("%x became leader at term %d", r.id, r.Term)
 }
 
-// appendEntry appends entries to the leader's log and broadcasts them.
-// Returns true if the entries were accepted.
+// appendEntry appends entries to the leader's log and sends a self-directed
+// MsgAppResp to msgsAfterAppend so the leader acknowledges its own entries
+// after persistence. Returns true if the entries were accepted.
 func (r *raft) appendEntry(es ...Entry) bool {
 	li := r.raftLog.lastIndex()
 	for i := range es {
 		es[i].Term = r.Term
 		es[i].Index = li + 1 + uint64(i)
 	}
-	r.raftLog.append(es...)
-	// The leader needs to track its own progress.
-	r.trk.Progress[r.id].MaybeUpdate(r.raftLog.lastIndex())
-	// Commit right away if possible (single-node cluster).
-	r.maybeCommit()
+	li = r.raftLog.append(es...)
+	// Send a self-directed MsgAppResp. This goes to msgsAfterAppend (because
+	// it is a response message). The RawNode will extract it and queue it in
+	// stepsOnAdvance, so it is only processed after the entries are persisted.
+	// This is how the leader acknowledges its own entries.
+	r.send(Message{To: r.id, Type: MsgAppResp, Index: li})
 	return true
 }
 
@@ -487,34 +501,29 @@ func (r *raft) campaign(t CampaignType) {
 		term = r.Term
 	}
 
-	// Vote for self.
-	r.trk.RecordVote(r.id, true)
-	if _, _, res := r.trk.TallyVotes(); res == VoteWon {
-		// Single node cluster. We won.
-		if t == campaignPreElection {
-			r.campaign(campaignElection)
-		} else {
-			r.becomeLeader()
-		}
-		return
-	}
-
-	// Send vote requests.
+	// Send vote requests to all peers. For self, send a self-directed
+	// vote response through the message pipeline (like etcd does).
+	var ids []uint64
 	for id := range r.trk.Progress {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+	for _, id := range ids {
 		if id == r.id {
+			// Cast a self-vote through the message pipeline.
+			r.send(Message{Term: term, To: id, Type: voteRespMsgType(voteMsg)})
 			continue
 		}
 		r.logger.Infof("%x [logterm: %d, index: %d] sent %s request to %x at term %d",
 			r.id, r.raftLog.lastTerm(), r.raftLog.lastIndex(), voteMsg, id, r.Term)
 
-		var ctx []byte
 		r.send(Message{
 			Term:    term,
 			To:      id,
 			Type:    voteMsg,
 			Index:   r.raftLog.lastIndex(),
 			LogTerm: r.raftLog.lastTerm(),
-			Context: ctx,
 		})
 	}
 }
@@ -750,6 +759,12 @@ func stepLeader(r *raft, m Message) error {
 				} else if oldPaused {
 					// If we were paused before, send more entries now.
 					r.sendAppend(m.From)
+				}
+
+				// Pipeline additional messages in replicate state (not to self).
+				if m.From != r.id {
+					for r.maybeSendAppend(m.From, false) {
+					}
 				}
 			}
 		}

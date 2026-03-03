@@ -1,11 +1,13 @@
 package main
 
 import (
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -14,15 +16,18 @@ import (
 	"github.com/harshithgowda/distributed-key-value-store/pkg/kvstore"
 	"github.com/harshithgowda/distributed-key-value-store/pkg/network"
 	"github.com/harshithgowda/distributed-key-value-store/pkg/raft"
+	"github.com/harshithgowda/distributed-key-value-store/pkg/snap"
 	"github.com/harshithgowda/distributed-key-value-store/pkg/wal"
 )
+
+const snapshotInterval uint64 = 10000
 
 func main() {
 	var (
 		id      = flag.Uint64("id", 0, "Node ID (must be > 0)")
 		addr    = flag.String("addr", ":8080", "Listen address")
 		peers   = flag.String("peers", "", "Comma-separated list of id=addr pairs (e.g., 1=:8080,2=:8081,3=:8082)")
-		dataDir = flag.String("data-dir", "", "Directory for WAL data (default: /tmp/raft-{id})")
+		dataDir = flag.String("data-dir", "", "Directory for persistent data (default: /tmp/raft-{id})")
 	)
 	flag.Parse()
 
@@ -45,11 +50,10 @@ func main() {
 		log.Fatalf("Node %d is not in the peer list", *id)
 	}
 
-	// Initialize WAL.
-	w, err := wal.New(*dataDir)
-	if err != nil {
-		log.Fatalf("Failed to create WAL: %v", err)
-	}
+	// Directory layout: {data-dir}/member/wal/ and {data-dir}/member/snap/
+	walDir := filepath.Join(*dataDir, "member", "wal")
+	snapDir := filepath.Join(*dataDir, "member", "snap")
+	dbPath := filepath.Join(snapDir, "db")
 
 	// Initialize MemoryStorage.
 	storage := raft.NewMemoryStorage()
@@ -76,31 +80,59 @@ func main() {
 		PreVote:         true,
 	}
 
-	var node raft.Node
+	// Initialize snapshotter (creates snapDir if needed).
+	snapshotter := snap.New(snapDir)
 
-	// Check if we are recovering from an existing WAL.
-	if w.Exists() {
+	var (
+		node      raft.Node
+		w         *wal.WAL
+		store     *kvstore.KVStore
+		snapIndex uint64 // index of last snapshot, for triggering new ones
+	)
+
+	if wal.Exists(walDir) {
+		// --- Recovery path ---
 		log.Println("Recovering from existing WAL...")
-		hs, snap, ents, err := w.ReadAll()
+
+		// 1. Load latest snapshot from disk.
+		var snapshot *raft.Snapshot
+		snapLocator := wal.SnapshotLocator{}
+		snapshot, err := snapshotter.Load()
+		if err != nil {
+			log.Printf("No snapshot found: %v", err)
+		} else {
+			log.Printf("Loaded snapshot at term=%d index=%d", snapshot.Metadata.Term, snapshot.Metadata.Index)
+			snapLocator = wal.SnapshotLocator{Term: snapshot.Metadata.Term, Index: snapshot.Metadata.Index}
+			snapIndex = snapshot.Metadata.Index
+		}
+
+		// 2. Open WAL from snapshot point.
+		w, err = wal.Open(walDir, snapLocator)
+		if err != nil {
+			log.Fatalf("Failed to open WAL: %v", err)
+		}
+
+		// 3. Replay WAL.
+		_, hs, ents, err := w.ReadAll()
 		if err != nil {
 			log.Fatalf("Failed to read WAL: %v", err)
 		}
 
-		// Restore snapshot.
-		if !raft.IsEmptySnap(snap) {
-			if err := storage.ApplySnapshot(snap); err != nil {
+		// 4. Apply snapshot to MemoryStorage.
+		if snapshot != nil {
+			if err := storage.ApplySnapshot(*snapshot); err != nil {
 				log.Fatalf("Failed to apply snapshot: %v", err)
 			}
 		}
 
-		// Restore hard state.
+		// 5. Restore hard state.
 		if !raft.IsEmptyHardState(hs) {
 			if err := storage.SetHardState(hs); err != nil {
 				log.Fatalf("Failed to set hard state: %v", err)
 			}
 		}
 
-		// Replay entries.
+		// 6. Replay entries.
 		if len(ents) > 0 {
 			if err := storage.Append(ents); err != nil {
 				log.Fatalf("Failed to append entries: %v", err)
@@ -108,14 +140,44 @@ func main() {
 			cfg.Applied = ents[len(ents)-1].Index
 		}
 
+		// 7. Restart raft node.
 		node = raft.RestartNode(cfg)
-	} else {
-		log.Println("Starting new node...")
-		node = raft.StartNode(cfg, raftPeers)
-	}
 
-	// Initialize KV store.
-	store := kvstore.NewKVStore(node)
+		// 8. Open bbolt KV store (it already has data from before crash;
+		//    if snapshot was received, RestoreSnapshot will be called in the loop).
+		store, err = kvstore.NewKVStore(dbPath, node)
+		if err != nil {
+			log.Fatalf("Failed to open KV store: %v", err)
+		}
+
+		// If we loaded a snapshot with data, restore KV from it.
+		if snapshot != nil && len(snapshot.Data) > 0 {
+			if err := store.RestoreSnapshot(snapshot.Data); err != nil {
+				log.Fatalf("Failed to restore KV from snapshot: %v", err)
+			}
+		}
+
+	} else {
+		// --- New cluster path ---
+		log.Println("Starting new node...")
+
+		// Encode node ID as metadata.
+		metadata := make([]byte, 8)
+		binary.LittleEndian.PutUint64(metadata, *id)
+
+		var err error
+		w, err = wal.Create(walDir, metadata)
+		if err != nil {
+			log.Fatalf("Failed to create WAL: %v", err)
+		}
+
+		node = raft.StartNode(cfg, raftPeers)
+
+		store, err = kvstore.NewKVStore(dbPath, node)
+		if err != nil {
+			log.Fatalf("Failed to create KV store: %v", err)
+		}
+	}
 
 	// Start HTTP server.
 	server := network.NewServer(node, store, *addr)
@@ -134,6 +196,7 @@ func main() {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
+	var lastApplied uint64
 	log.Printf("Node %d started. Peers: %v", *id, peerMap)
 
 	for {
@@ -147,16 +210,35 @@ func main() {
 				log.Fatalf("Failed to save to WAL: %v", err)
 			}
 
-			// 2. Save snapshot if any.
+			// 2. Handle snapshot if any.
 			if !raft.IsEmptySnap(rd.Snapshot) {
-				if err := w.SaveSnapshot(rd.Snapshot); err != nil {
-					log.Fatalf("Failed to save snapshot: %v", err)
+				// Save snapshot marker in WAL.
+				sl := wal.SnapshotLocator{
+					Term:  rd.Snapshot.Metadata.Term,
+					Index: rd.Snapshot.Metadata.Index,
 				}
+				if err := w.SaveSnapshot(sl); err != nil {
+					log.Fatalf("Failed to save snapshot to WAL: %v", err)
+				}
+
+				// Save snapshot file to disk.
+				if err := snapshotter.SaveSnap(rd.Snapshot); err != nil {
+					log.Fatalf("Failed to save snapshot file: %v", err)
+				}
+
+				// Apply to MemoryStorage.
 				if err := storage.ApplySnapshot(rd.Snapshot); err != nil {
 					log.Fatalf("Failed to apply snapshot to storage: %v", err)
 				}
-				// Restore KV state from snapshot.
-				store.RestoreSnapshot(rd.Snapshot.Data)
+
+				// Restore KV state from snapshot data.
+				if len(rd.Snapshot.Data) > 0 {
+					if err := store.RestoreSnapshot(rd.Snapshot.Data); err != nil {
+						log.Fatalf("Failed to restore KV from snapshot: %v", err)
+					}
+				}
+
+				snapIndex = rd.Snapshot.Metadata.Index
 			}
 
 			// 3. Save entries to MemoryStorage.
@@ -170,12 +252,49 @@ func main() {
 			// 5. Apply committed entries to the state machine.
 			store.ApplyCommitted(rd.CommittedEntries)
 
+			// Track last applied index for snapshot triggering.
+			if n := len(rd.CommittedEntries); n > 0 {
+				lastApplied = rd.CommittedEntries[n-1].Index
+			}
+
 			// 6. Advance.
 			node.Advance()
+
+			// 7. Trigger snapshot if enough entries have been applied.
+			if lastApplied > 0 && lastApplied-snapIndex >= snapshotInterval {
+				data, err := store.TakeSnapshot()
+				if err != nil {
+					log.Printf("Failed to take snapshot: %v", err)
+				} else {
+					compactSnap, err := storage.CreateSnapshot(lastApplied, nil, data)
+					if err != nil {
+						log.Printf("Failed to create snapshot: %v", err)
+					} else {
+						if err := snapshotter.SaveSnap(compactSnap); err != nil {
+							log.Printf("Failed to save snapshot: %v", err)
+						} else {
+							sl := wal.SnapshotLocator{
+								Term:  compactSnap.Metadata.Term,
+								Index: compactSnap.Metadata.Index,
+							}
+							if err := w.SaveSnapshot(sl); err != nil {
+								log.Printf("Failed to save snapshot to WAL: %v", err)
+							}
+							if err := storage.Compact(lastApplied); err != nil {
+								log.Printf("Failed to compact storage: %v", err)
+							}
+							snapIndex = lastApplied
+							log.Printf("Snapshot taken at index %d", lastApplied)
+						}
+					}
+				}
+			}
 
 		case <-sigc:
 			log.Println("Shutting down...")
 			node.Stop()
+			store.Close()
+			w.Close()
 			return
 		}
 	}

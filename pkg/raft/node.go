@@ -87,10 +87,11 @@ func newNode(rn *RawNode) node {
 // (proposals, messages, ticks) and outputs (Ready) through channels.
 func (n *node) run() {
 	var (
-		propc    chan msgWithResult
-		readyc   chan Ready
-		advancec chan struct{}
-		rd       Ready
+		propc      chan msgWithResult
+		readyc     chan Ready
+		advancec   chan struct{}
+		rd         Ready
+		hasReady   bool
 	)
 
 	r := n.rn.raft
@@ -101,9 +102,14 @@ func (n *node) run() {
 		if advancec != nil {
 			// We're waiting for the application to call Advance.
 			readyc = nil
+		} else if hasReady {
+			// Ready was already computed; arm the channel.
+			readyc = n.readyc
 		} else if n.rn.HasReady() {
+			// Compute Ready only once per cycle.
 			rd = n.rn.Ready()
 			readyc = n.readyc
+			hasReady = true
 		} else {
 			readyc = nil
 		}
@@ -137,6 +143,7 @@ func (n *node) run() {
 			n.rn.Advance(rd)
 			rd = Ready{}
 			advancec = nil
+			hasReady = false
 		case c := <-n.status:
 			c <- getStatus(r)
 		case <-n.stop:

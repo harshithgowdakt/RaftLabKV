@@ -1,13 +1,20 @@
 package kvstore
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/harshithgowda/distributed-key-value-store/pkg/raft"
+	bolt "go.etcd.io/bbolt"
 )
+
+var bucketName = []byte("key")
 
 // Operation represents a KV store operation.
 type Operation struct {
@@ -16,39 +23,61 @@ type Operation struct {
 	Value string `json:"value,omitempty"`
 }
 
-// KVStore is a simple in-memory key-value store backed by raft. Writes go
-// through raft.Node.Propose(); the main loop calls ApplyCommitted() with
-// committed entries from Ready.
+// KVStore is a persistent key-value store backed by bbolt and raft.
+// Writes go through raft.Node.Propose(); the main loop calls
+// ApplyCommitted() with committed entries from Ready.
 type KVStore struct {
-	mu   sync.RWMutex
-	data map[string]string
-	node raft.Node
+	db     *bolt.DB
+	node   raft.Node
+	dbPath string
 
-	// pending tracks in-flight proposals. When Put/Delete is called, we
-	// create a channel and block until the entry is committed and applied.
 	pendingMu sync.Mutex
 	pending   map[string]chan error
 }
 
-// NewKVStore creates a new KVStore.
-func NewKVStore(node raft.Node) *KVStore {
-	return &KVStore{
-		data:    make(map[string]string),
-		node:    node,
-		pending: make(map[string]chan error),
+// NewKVStore opens (or creates) a bbolt database at dbPath and returns
+// a new KVStore. The "key" bucket is created if it does not exist.
+func NewKVStore(dbPath string, node raft.Node) (*KVStore, error) {
+	db, err := bolt.Open(dbPath, 0640, nil)
+	if err != nil {
+		return nil, fmt.Errorf("kvstore: open db: %w", err)
 	}
+
+	// Ensure the bucket exists.
+	if err := db.Update(func(tx *bolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists(bucketName)
+		return err
+	}); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("kvstore: create bucket: %w", err)
+	}
+
+	return &KVStore{
+		db:      db,
+		node:    node,
+		dbPath:  dbPath,
+		pending: make(map[string]chan error),
+	}, nil
 }
 
-// Get returns the value for the given key.
+// Get returns the value for the given key using a bbolt read transaction.
 func (kv *KVStore) Get(key string) (string, bool) {
-	kv.mu.RLock()
-	defer kv.mu.RUnlock()
-	value, exists := kv.data[key]
-	return value, exists
+	var val string
+	var found bool
+	kv.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketName)
+		v := b.Get([]byte(key))
+		if v != nil {
+			val = string(v)
+			found = true
+		}
+		return nil
+	})
+	return val, found
 }
 
-// Put proposes a PUT operation through raft. It blocks until the entry is
-// committed and applied, or returns an error.
+// Put proposes a PUT operation through raft. It blocks until the entry
+// is committed and applied, or returns an error.
 func (kv *KVStore) Put(key, value string) error {
 	op := Operation{Type: "PUT", Key: key, Value: value}
 	return kv.propose(op)
@@ -60,14 +89,17 @@ func (kv *KVStore) Delete(key string) error {
 	return kv.propose(op)
 }
 
-// GetAll returns a copy of all key-value pairs.
+// GetAll returns a copy of all key-value pairs using a bbolt read transaction.
 func (kv *KVStore) GetAll() map[string]string {
-	kv.mu.RLock()
-	defer kv.mu.RUnlock()
-	result := make(map[string]string, len(kv.data))
-	for k, v := range kv.data {
-		result[k] = v
-	}
+	result := make(map[string]string)
+	kv.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketName)
+		b.ForEach(func(k, v []byte) error {
+			result[string(k)] = string(v)
+			return nil
+		})
+		return nil
+	})
 	return result
 }
 
@@ -77,8 +109,6 @@ func (kv *KVStore) propose(op Operation) error {
 		return err
 	}
 
-	// Create a unique key for this proposal so we can wait for it.
-	// We use the serialized op as the key - this is simple but sufficient.
 	proposalKey := string(data)
 
 	ch := make(chan error, 1)
@@ -92,22 +122,26 @@ func (kv *KVStore) propose(op Operation) error {
 		kv.pendingMu.Unlock()
 	}()
 
-	// Propose through raft.
-	if err := kv.node.Propose(nil, data); err != nil {
+	if err := kv.node.Propose(context.TODO(), data); err != nil {
 		return fmt.Errorf("propose failed: %w", err)
 	}
 
-	// Wait for the entry to be committed and applied.
 	return <-ch
 }
 
 // ApplyCommitted applies committed entries from the raft log to the
-// KV store. This is called by the main application loop when processing
-// Ready.CommittedEntries.
+// KV store. All entries are applied in a single bbolt transaction
+// (one fsync). Called by the main loop when processing Ready.CommittedEntries.
 func (kv *KVStore) ApplyCommitted(entries []raft.Entry) {
+	// Collect operations to apply.
+	type pendingOp struct {
+		op          Operation
+		proposalKey string
+	}
+	var ops []pendingOp
+
 	for _, entry := range entries {
 		if entry.Data == nil {
-			// Empty entry (e.g., leader's initial empty entry).
 			continue
 		}
 
@@ -116,44 +150,92 @@ func (kv *KVStore) ApplyCommitted(entries []raft.Entry) {
 			log.Printf("kvstore: failed to unmarshal entry: %v", err)
 			continue
 		}
+		ops = append(ops, pendingOp{op: op, proposalKey: string(entry.Data)})
+	}
 
-		kv.mu.Lock()
-		switch op.Type {
-		case "PUT":
-			kv.data[op.Key] = op.Value
-		case "DELETE":
-			delete(kv.data, op.Key)
-		default:
-			log.Printf("kvstore: unknown op type: %s", op.Type)
+	if len(ops) == 0 {
+		return
+	}
+
+	// Apply all ops in a single bbolt write transaction.
+	err := kv.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketName)
+		for _, po := range ops {
+			switch po.op.Type {
+			case "PUT":
+				if err := b.Put([]byte(po.op.Key), []byte(po.op.Value)); err != nil {
+					return err
+				}
+			case "DELETE":
+				if err := b.Delete([]byte(po.op.Key)); err != nil {
+					return err
+				}
+			default:
+				log.Printf("kvstore: unknown op type: %s", po.op.Type)
+			}
 		}
-		kv.mu.Unlock()
+		return nil
+	})
 
-		// Notify the pending proposal, if any.
-		proposalKey := string(entry.Data)
+	if err != nil {
+		log.Printf("kvstore: bbolt update failed: %v", err)
+	}
+
+	// Notify pending proposals.
+	for _, po := range ops {
 		kv.pendingMu.Lock()
-		if ch, ok := kv.pending[proposalKey]; ok {
-			ch <- nil
-			delete(kv.pending, proposalKey)
+		if ch, ok := kv.pending[po.proposalKey]; ok {
+			ch <- err
+			delete(kv.pending, po.proposalKey)
 		}
 		kv.pendingMu.Unlock()
 	}
 }
 
-// TakeSnapshot returns a JSON snapshot of the current data.
+// TakeSnapshot returns a copy of the entire bbolt database file.
+// This is the snapshot data that gets stored in raft snapshot files.
 func (kv *KVStore) TakeSnapshot() ([]byte, error) {
-	kv.mu.RLock()
-	defer kv.mu.RUnlock()
-	return json.Marshal(kv.data)
+	var buf bytes.Buffer
+	err := kv.db.View(func(tx *bolt.Tx) error {
+		_, err := tx.WriteTo(&buf)
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("kvstore: snapshot: %w", err)
+	}
+	return buf.Bytes(), nil
 }
 
-// RestoreSnapshot restores the KV store from a snapshot.
+// RestoreSnapshot replaces the bbolt database with the given snapshot data.
+// It closes the current db, writes the data to a temp file, renames it
+// over the original, and reopens.
 func (kv *KVStore) RestoreSnapshot(data []byte) error {
-	var newData map[string]string
-	if err := json.Unmarshal(data, &newData); err != nil {
-		return err
+	if err := kv.db.Close(); err != nil {
+		return fmt.Errorf("kvstore: close for restore: %w", err)
 	}
-	kv.mu.Lock()
-	kv.data = newData
-	kv.mu.Unlock()
+
+	dir := filepath.Dir(kv.dbPath)
+	tmp := filepath.Join(dir, "db.tmp")
+
+	if err := os.WriteFile(tmp, data, 0640); err != nil {
+		return fmt.Errorf("kvstore: write tmp: %w", err)
+	}
+	if err := os.Rename(tmp, kv.dbPath); err != nil {
+		return fmt.Errorf("kvstore: rename: %w", err)
+	}
+
+	db, err := bolt.Open(kv.dbPath, 0640, nil)
+	if err != nil {
+		return fmt.Errorf("kvstore: reopen: %w", err)
+	}
+	kv.db = db
+	return nil
+}
+
+// Close closes the bbolt database.
+func (kv *KVStore) Close() error {
+	if kv.db != nil {
+		return kv.db.Close()
+	}
 	return nil
 }

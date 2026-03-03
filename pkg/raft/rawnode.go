@@ -111,15 +111,16 @@ func (rn *RawNode) readyWithoutAccept() Ready {
 	rd := Ready{
 		Entries:          r.raftLog.nextUnstableEnts(),
 		CommittedEntries: r.raftLog.nextCommittedEnts(),
-		// Merge msgs and msgsAfterAppend. In synchronous mode, by the time
-		// the application sends these messages, the entries will already be
-		// persisted (the app persists first, then sends).
-		Messages: r.msgs,
+		Messages:         r.msgs,
 	}
 
-	// Append msgsAfterAppend to Messages.
-	if len(r.msgsAfterAppend) > 0 {
-		rd.Messages = append(rd.Messages, r.msgsAfterAppend...)
+	// In synchronous mode, include non-self msgsAfterAppend in Messages.
+	// Self-directed messages (e.g., leader's MsgAppResp to itself) are
+	// extracted in acceptReady() and queued to stepsOnAdvance instead.
+	for _, m := range r.msgsAfterAppend {
+		if m.To != r.id {
+			rd.Messages = append(rd.Messages, m)
+		}
 	}
 
 	softSt := r.softState()
@@ -153,10 +154,31 @@ func (rn *RawNode) acceptReady(rd Ready) {
 	if rd.SoftState != nil {
 		rn.prevSoftSt = rd.SoftState
 	}
+	if !IsEmptyHardState(rd.HardState) {
+		rn.prevHardSt = rd.HardState
+	}
 
 	if len(rd.ReadStates) != 0 {
 		r.readStates = nil
 	}
+
+	// Extract self-directed messages from msgsAfterAppend and queue them
+	// in stepsOnAdvance. These will be processed when Advance() is called,
+	// ensuring they are only stepped after the application has persisted
+	// the entries. This is critical for the leader's self-ack MsgAppResp
+	// and self-directed vote responses.
+	if len(rn.stepsOnAdvance) != 0 {
+		r.logger.Panicf("two accepted Ready structs without call to Advance")
+	}
+	for _, m := range r.msgsAfterAppend {
+		if m.To == r.id {
+			rn.stepsOnAdvance = append(rn.stepsOnAdvance, m)
+		}
+	}
+
+	// Clear messages.
+	r.msgs = nil
+	r.msgsAfterAppend = nil
 
 	// Mark unstable entries as in-progress.
 	r.raftLog.acceptUnstable()
@@ -166,10 +188,6 @@ func (rn *RawNode) acceptReady(rd Ready) {
 		last := rd.CommittedEntries[len(rd.CommittedEntries)-1]
 		r.raftLog.acceptApplying(last.Index)
 	}
-
-	// Clear messages.
-	r.msgs = nil
-	r.msgsAfterAppend = nil
 }
 
 // Advance notifies the RawNode that the application has persisted and
@@ -178,18 +196,13 @@ func (rn *RawNode) acceptReady(rd Ready) {
 func (rn *RawNode) Advance(rd Ready) {
 	r := rn.raft
 
-	// Update hard state.
-	if !IsEmptyHardState(rd.HardState) {
-		rn.prevHardSt = rd.HardState
-	}
-
-	// Stabilize entries.
+	// Stabilize persisted entries - remove them from the unstable buffer.
 	if len(rd.Entries) > 0 {
 		e := rd.Entries[len(rd.Entries)-1]
 		r.raftLog.stableTo(e.Index, e.Term)
 	}
 
-	// Stabilize snapshot.
+	// Stabilize persisted snapshot.
 	if !IsEmptySnap(rd.Snapshot) {
 		r.raftLog.stableSnapTo(rd.Snapshot.Metadata.Index)
 	}
@@ -200,11 +213,15 @@ func (rn *RawNode) Advance(rd Ready) {
 		r.raftLog.appliedTo(last.Index)
 	}
 
-	// Process queued self-directed messages (e.g., leader's MsgAppResp to self).
-	for _, m := range rn.stepsOnAdvance {
+	// Process queued self-directed messages. These were extracted from
+	// msgsAfterAppend in acceptReady(). Now that entries are persisted,
+	// it is safe to step them (e.g., leader's self-ack MsgAppResp which
+	// updates progress and may advance the commit index).
+	for i, m := range rn.stepsOnAdvance {
 		_ = r.Step(m)
+		rn.stepsOnAdvance[i] = Message{} // zero for GC
 	}
-	rn.stepsOnAdvance = nil
+	rn.stepsOnAdvance = rn.stepsOnAdvance[:0]
 }
 
 // Bootstrap initializes the RawNode for first use by appending configuration
