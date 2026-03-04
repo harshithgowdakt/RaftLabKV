@@ -15,13 +15,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/harshithgowda/distributed-key-value-store/pkg/fileutil"
-	"github.com/harshithgowda/distributed-key-value-store/pkg/kvstore"
-	"github.com/harshithgowda/distributed-key-value-store/pkg/network"
-	"github.com/harshithgowda/distributed-key-value-store/pkg/raft"
-	"github.com/harshithgowda/distributed-key-value-store/pkg/snap"
-	"github.com/harshithgowda/distributed-key-value-store/pkg/wal"
-	"github.com/harshithgowda/distributed-key-value-store/pkg/wal/walpb"
+	"github.com/harshithgowdakt/raftlabkv/pkg/fileutil"
+	"github.com/harshithgowdakt/raftlabkv/pkg/kvstore"
+	"github.com/harshithgowdakt/raftlabkv/pkg/network"
+	"github.com/harshithgowdakt/raftlabkv/pkg/raft"
+	"github.com/harshithgowdakt/raftlabkv/pkg/snap"
+	"github.com/harshithgowdakt/raftlabkv/pkg/wal"
+	"github.com/harshithgowdakt/raftlabkv/pkg/wal/walpb"
 )
 
 const snapshotInterval uint64 = 10000

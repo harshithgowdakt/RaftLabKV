@@ -1,7 +1,7 @@
 syntax = "proto3";
 package walpb;
 
-option go_package = "github.com/harshithgowda/distributed-key-value-store/pkg/wal/walpb";
+option go_package = "github.com/harshithgowdakt/raftlabkv/pkg/wal/walpb";
 
 message Record {
     int64  type = 1;

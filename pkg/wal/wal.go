@@ -25,19 +25,19 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/harshithgowda/distributed-key-value-store/pkg/fileutil"
-	"github.com/harshithgowda/distributed-key-value-store/pkg/raft"
-	"github.com/harshithgowda/distributed-key-value-store/pkg/wal/walpb"
+	"github.com/harshithgowdakt/raftlabkv/pkg/fileutil"
+	"github.com/harshithgowdakt/raftlabkv/pkg/raft"
+	"github.com/harshithgowdakt/raftlabkv/pkg/wal/walpb"
 	"google.golang.org/protobuf/proto"
 )
 
 // Record types (1-indexed, matching etcd).
 const (
 	MetadataType int64 = iota + 1 // 1
-	EntryType                      // 2
-	StateType                      // 3
-	CrcType                        // 4
-	SnapshotType                   // 5
+	EntryType                     // 2
+	StateType                     // 3
+	CrcType                       // 4
+	SnapshotType                  // 5
 )
 
 // SegmentSizeBytes is the target size for WAL segments. When a segment

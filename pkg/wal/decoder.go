@@ -8,7 +8,7 @@ import (
 	"io"
 	"sync"
 
-	"github.com/harshithgowda/distributed-key-value-store/pkg/wal/walpb"
+	"github.com/harshithgowdakt/raftlabkv/pkg/wal/walpb"
 	"google.golang.org/protobuf/proto"
 )
 

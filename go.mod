@@ -1,4 +1,4 @@
-module github.com/harshithgowda/distributed-key-value-store
+module github.com/harshithgowdakt/raftlabkv
 
 go 1.24.5
 

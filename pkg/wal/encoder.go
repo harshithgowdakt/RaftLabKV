@@ -8,7 +8,7 @@ import (
 	"os"
 	"sync"
 
-	"github.com/harshithgowda/distributed-key-value-store/pkg/wal/walpb"
+	"github.com/harshithgowdakt/raftlabkv/pkg/wal/walpb"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -27,8 +27,8 @@ type encoder struct {
 	mu        sync.Mutex
 	pw        *pageWriter
 	crc       hash.Hash32
-	buf       []byte   // reusable marshal buffer
-	uint64buf [8]byte  // reusable frame size buffer
+	buf       []byte  // reusable marshal buffer
+	uint64buf [8]byte // reusable frame size buffer
 }
 
 func newEncoder(w io.Writer, prevCrc uint32, pageOffset int) *encoder {

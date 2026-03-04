@@ -12,7 +12,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/harshithgowda/distributed-key-value-store/pkg/raft"
+	"github.com/harshithgowdakt/raftlabkv/pkg/raft"
 )
 
 const maxRetainedSnapshots = 5

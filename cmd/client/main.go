@@ -7,7 +7,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/harshithgowda/distributed-key-value-store/pkg/client"
+	"github.com/harshithgowdakt/raftlabkv/pkg/client"
 )
 
 func main() {

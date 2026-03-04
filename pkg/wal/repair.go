@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/harshithgowda/distributed-key-value-store/pkg/fileutil"
-	"github.com/harshithgowda/distributed-key-value-store/pkg/wal/walpb"
+	"github.com/harshithgowdakt/raftlabkv/pkg/fileutil"
+	"github.com/harshithgowdakt/raftlabkv/pkg/wal/walpb"
 )
 
 // Repair attempts to fix a corrupted WAL by truncating the last segment

@@ -6,8 +6,8 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/harshithgowda/distributed-key-value-store/pkg/kvstore"
-	"github.com/harshithgowda/distributed-key-value-store/pkg/raft"
+	"github.com/harshithgowdakt/raftlabkv/pkg/kvstore"
+	"github.com/harshithgowdakt/raftlabkv/pkg/raft"
 )
 
 // Server is the HTTP server that handles both raft messages and KV API

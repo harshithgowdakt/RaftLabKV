@@ -7,11 +7,12 @@
 package walpb
 
 import (
-	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
-	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	reflect "reflect"
 	sync "sync"
 	unsafe "unsafe"
+
+	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
+	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 )
 
 const (
@@ -146,7 +147,7 @@ const file_pkg_wal_walpb_record_proto_rawDesc = "" +
 	"\x04data\x18\x03 \x01(\fR\x04data\"4\n" +
 	"\bSnapshot\x12\x14\n" +
 	"\x05index\x18\x01 \x01(\x04R\x05index\x12\x12\n" +
-	"\x04term\x18\x02 \x01(\x04R\x04termBDZBgithub.com/harshithgowda/distributed-key-value-store/pkg/wal/walpbb\x06proto3"
+	"\x04term\x18\x02 \x01(\x04R\x04termBDZBgithub.com/harshithgowdakt/raftlabkv/pkg/wal/walpbb\x06proto3"
 
 var (
 	file_pkg_wal_walpb_record_proto_rawDescOnce sync.Once

@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/harshithgowda/distributed-key-value-store/pkg/raft"
+	"github.com/harshithgowdakt/raftlabkv/pkg/raft"
 )
 
 // Transport sends raft messages to peers via HTTP. It maps uint64 node IDs

@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/harshithgowda/distributed-key-value-store/pkg/fileutil"
+	"github.com/harshithgowdakt/raftlabkv/pkg/fileutil"
 )
 
 // filePipeline pre-allocates segment files in a background goroutine.
