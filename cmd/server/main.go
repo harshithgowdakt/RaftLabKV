@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -10,9 +11,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/harshithgowda/distributed-key-value-store/pkg/fileutil"
 	"github.com/harshithgowda/distributed-key-value-store/pkg/kvstore"
 	"github.com/harshithgowda/distributed-key-value-store/pkg/network"
 	"github.com/harshithgowda/distributed-key-value-store/pkg/raft"
@@ -22,6 +25,12 @@ import (
 )
 
 const snapshotInterval uint64 = 10000
+
+// Maximum number of old WAL/snap files to keep before purging.
+const (
+	maxWALFiles  uint = 5
+	maxSnapFiles uint = 5
+)
 
 func main() {
 	var (
@@ -183,13 +192,19 @@ func main() {
 	}
 
 	// Start HTTP server.
-	server := network.NewServer(node, store, *addr)
+	httpServer := network.NewServer(node, store, *addr)
 	go func() {
 		log.Printf("Node %d listening on %s", *id, *addr)
-		if err := server.Start(); err != nil {
+		if err := httpServer.Start(); err != nil {
 			log.Fatalf("HTTP server failed: %v", err)
 		}
 	}()
+
+	// Start periodic purge goroutines for old WAL and snapshot files.
+	purgeCtx, purgeCancel := context.WithCancel(context.Background())
+	var purgeWg sync.WaitGroup
+	fileutil.PurgeFile(purgeCtx, &purgeWg, walDir, ".wal", maxWALFiles)
+	fileutil.PurgeFileWithoutFlock(purgeCtx, &purgeWg, snapDir, ".snap", maxSnapFiles)
 
 	// Signal handling.
 	sigc := make(chan os.Signal, 1)
@@ -298,6 +313,16 @@ func main() {
 
 		case <-sigc:
 			log.Println("Shutting down...")
+
+			// Gracefully shut down the HTTP server (5s deadline for in-flight requests).
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := httpServer.Shutdown(shutdownCtx); err != nil {
+				log.Printf("HTTP server shutdown error: %v", err)
+			}
+			shutdownCancel()
+
+			purgeCancel()
+			purgeWg.Wait()
 			node.Stop()
 			store.Close()
 			w.Close()

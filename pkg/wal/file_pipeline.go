@@ -1,9 +1,11 @@
 package wal
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/harshithgowda/distributed-key-value-store/pkg/fileutil"
 )
@@ -16,25 +18,30 @@ type filePipeline struct {
 	size  int64
 	count int
 
-	filec chan *fileutil.LockedFile
-	errc  chan error
-	donec chan struct{}
+	filec  chan *fileutil.LockedFile
+	errc   chan error
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
 func newFilePipeline(dir string, fileSize int64) *filePipeline {
+	ctx, cancel := context.WithCancel(context.Background())
 	fp := &filePipeline{
-		dir:   dir,
-		size:  fileSize,
-		filec: make(chan *fileutil.LockedFile),
-		errc:  make(chan error, 1),
-		donec: make(chan struct{}),
+		dir:    dir,
+		size:   fileSize,
+		filec:  make(chan *fileutil.LockedFile),
+		errc:   make(chan error, 1),
+		ctx:    ctx,
+		cancel: cancel,
 	}
+	fp.wg.Add(1)
 	go fp.run()
 	return fp
 }
 
 func (fp *filePipeline) run() {
-	defer close(fp.donec)
+	defer fp.wg.Done()
 	for {
 		f, err := fp.alloc()
 		if err != nil {
@@ -43,7 +50,7 @@ func (fp *filePipeline) run() {
 		}
 		select {
 		case fp.filec <- f:
-		case <-fp.donec:
+		case <-fp.ctx.Done():
 			// Pipeline is closing — clean up the pre-allocated file.
 			os.Remove(f.Name())
 			f.Close()
@@ -81,8 +88,9 @@ func (fp *filePipeline) Open() (*fileutil.LockedFile, error) {
 	}
 }
 
-// Close shuts down the pipeline goroutine.
+// Close shuts down the pipeline goroutine and waits for it to exit.
 func (fp *filePipeline) Close() error {
-	close(fp.donec)
+	fp.cancel()
+	fp.wg.Wait()
 	return nil
 }

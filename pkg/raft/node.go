@@ -1,6 +1,9 @@
 package raft
 
-import "context"
+import (
+	"context"
+	"sync"
+)
 
 // Node represents a node in a raft cluster. It is the primary interface
 // for the application to interact with the raft state machine.
@@ -62,23 +65,26 @@ type node struct {
 	readyc   chan Ready
 	advancec chan struct{}
 	tickc    chan struct{}
-	done     chan struct{}
-	stop     chan struct{}
 	status   chan chan Status
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 
 	rn *RawNode
 }
 
 func newNode(rn *RawNode) node {
+	ctx, cancel := context.WithCancel(context.Background())
 	return node{
 		propc:    make(chan msgWithResult),
 		recvc:    make(chan Message),
 		readyc:   make(chan Ready),
 		advancec: make(chan struct{}),
 		tickc:    make(chan struct{}, 128),
-		done:     make(chan struct{}),
-		stop:     make(chan struct{}),
 		status:   make(chan chan Status),
+		ctx:      ctx,
+		cancel:   cancel,
 		rn:       rn,
 	}
 }
@@ -86,12 +92,14 @@ func newNode(rn *RawNode) node {
 // run is the main event loop for the node. It multiplexes all inputs
 // (proposals, messages, ticks) and outputs (Ready) through channels.
 func (n *node) run() {
+	defer n.wg.Done()
+
 	var (
-		propc      chan msgWithResult
-		readyc     chan Ready
-		advancec   chan struct{}
-		rd         Ready
-		hasReady   bool
+		propc    chan msgWithResult
+		readyc   chan Ready
+		advancec chan struct{}
+		rd       Ready
+		hasReady bool
 	)
 
 	r := n.rn.raft
@@ -146,8 +154,7 @@ func (n *node) run() {
 			hasReady = false
 		case c := <-n.status:
 			c <- getStatus(r)
-		case <-n.stop:
-			close(n.done)
+		case <-n.ctx.Done():
 			return
 		}
 	}
@@ -157,7 +164,7 @@ func (n *node) run() {
 func (n *node) Tick() {
 	select {
 	case n.tickc <- struct{}{}:
-	case <-n.done:
+	case <-n.ctx.Done():
 	default:
 		// Tick channel is full; a tick was dropped.
 	}
@@ -200,7 +207,7 @@ func (n *node) stepWithWaitOption(ctx context.Context, m Message, wait bool) err
 			return nil
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-n.done:
+		case <-n.ctx.Done():
 			return ErrStopped
 		}
 	}
@@ -217,7 +224,7 @@ func (n *node) stepWithWaitOption(ctx context.Context, m Message, wait bool) err
 		}
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-n.done:
+	case <-n.ctx.Done():
 		return ErrStopped
 	}
 
@@ -228,7 +235,7 @@ func (n *node) stepWithWaitOption(ctx context.Context, m Message, wait bool) err
 		}
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-n.done:
+	case <-n.ctx.Done():
 		return ErrStopped
 	}
 	return nil
@@ -243,7 +250,7 @@ func (n *node) Ready() <-chan Ready {
 func (n *node) Advance() {
 	select {
 	case n.advancec <- struct{}{}:
-	case <-n.done:
+	case <-n.ctx.Done():
 	}
 }
 
@@ -261,7 +268,7 @@ func (n *node) Status() Status {
 	select {
 	case n.status <- c:
 		return <-c
-	case <-n.done:
+	case <-n.ctx.Done():
 		return Status{}
 	}
 }
@@ -270,7 +277,7 @@ func (n *node) Status() Status {
 func (n *node) ReportUnreachable(id uint64) {
 	select {
 	case n.recvc <- Message{Type: MsgUnreachable, From: id}:
-	case <-n.done:
+	case <-n.ctx.Done():
 	}
 }
 
@@ -279,21 +286,14 @@ func (n *node) ReportSnapshot(id uint64, status SnapshotStatus) {
 	rej := status == SnapshotFailure
 	select {
 	case n.recvc <- Message{Type: MsgSnapStatus, From: id, Reject: rej}:
-	case <-n.done:
+	case <-n.ctx.Done():
 	}
 }
 
-// Stop implements the Node interface.
+// Stop implements the Node interface. It is safe to call multiple times.
 func (n *node) Stop() {
-	select {
-	case n.stop <- struct{}{}:
-		// Not already stopped, so trigger it.
-	case <-n.done:
-		// Node has already been stopped - no need to do anything.
-		return
-	}
-	// Block until the stop has been acknowledged by run().
-	<-n.done
+	n.cancel()
+	n.wg.Wait()
 }
 
 // ErrStopped is returned by methods after a Node has been stopped.
@@ -311,6 +311,7 @@ func StartNode(c *Config, peers []Peer) Node {
 	}
 
 	n := newNode(rn)
+	n.wg.Add(1)
 	go n.run()
 	return &n
 }
@@ -325,6 +326,7 @@ func RestartNode(c *Config) Node {
 	}
 
 	n := newNode(rn)
+	n.wg.Add(1)
 	go n.run()
 	return &n
 }

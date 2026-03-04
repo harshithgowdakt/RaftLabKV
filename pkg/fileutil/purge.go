@@ -1,11 +1,13 @@
 package fileutil
 
 import (
+	"context"
 	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -13,50 +15,48 @@ const defaultPurgeInterval = 30 * time.Second
 
 // PurgeFile periodically removes old files matching the given suffix in dir,
 // keeping at most max files. It attempts to flock each file before removing
-// (safe for WAL files that may still be held by the WAL). Runs until stop
-// is closed. Returns a done channel that is closed when the goroutine exits.
-func PurgeFile(dir, suffix string, max uint, stop <-chan struct{}) <-chan struct{} {
-	return PurgeFileWithInterval(dir, suffix, max, defaultPurgeInterval, stop)
+// (safe for WAL files that may still be held by the WAL). Runs until the
+// context is cancelled. The WaitGroup is decremented when the goroutine exits.
+func PurgeFile(ctx context.Context, wg *sync.WaitGroup, dir, suffix string, max uint) {
+	PurgeFileWithInterval(ctx, wg, dir, suffix, max, defaultPurgeInterval)
 }
 
 // PurgeFileWithInterval is like PurgeFile but with a configurable interval.
-func PurgeFileWithInterval(dir, suffix string, max uint, interval time.Duration, stop <-chan struct{}) <-chan struct{} {
-	done := make(chan struct{})
+func PurgeFileWithInterval(ctx context.Context, wg *sync.WaitGroup, dir, suffix string, max uint, interval time.Duration) {
+	wg.Add(1)
 	go func() {
-		defer close(done)
+		defer wg.Done()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
 				purgeOnce(dir, suffix, max, true)
-			case <-stop:
+			case <-ctx.Done():
 				return
 			}
 		}
 	}()
-	return done
 }
 
 // PurgeFileWithoutFlock is like PurgeFile but does not attempt to
 // acquire a lock before deleting. Used for snapshot files which are
 // not locked.
-func PurgeFileWithoutFlock(dir, suffix string, max uint, stop <-chan struct{}) <-chan struct{} {
-	done := make(chan struct{})
+func PurgeFileWithoutFlock(ctx context.Context, wg *sync.WaitGroup, dir, suffix string, max uint) {
+	wg.Add(1)
 	go func() {
-		defer close(done)
+		defer wg.Done()
 		ticker := time.NewTicker(defaultPurgeInterval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
 				purgeOnce(dir, suffix, max, false)
-			case <-stop:
+			case <-ctx.Done():
 				return
 			}
 		}
 	}()
-	return done
 }
 
 func purgeOnce(dir, suffix string, max uint, useFlock bool) {
