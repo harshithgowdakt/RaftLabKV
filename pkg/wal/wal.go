@@ -139,22 +139,20 @@ func Create(dir string, metadata []byte) (*WAL, error) {
 		return nil, err
 	}
 
+	// Close the old locked file BEFORE re-opening at the new path.
+	// On macOS, flock(LOCK_EX) blocks even within the same process
+	// if a different fd holds an exclusive lock on the same inode.
+	w.locks[0].Close()
+
 	// Re-open the file with the final path for the lock.
 	newPath := filepath.Join(dir, walName(0, 0))
 	newF, err := fileutil.LockFile(newPath, os.O_WRONLY|os.O_APPEND, fileutil.PrivateFileMode)
 	if err != nil {
 		return nil, err
 	}
-	// Close the old locked file (it was in tmp dir).
-	w.locks[0].Close()
 	w.locks[0] = newF
 
-	// Repoint encoder to the new file.
-	w.encoder = newFileEncoder(newF.File, 0)
-	// Replay to bring encoder CRC up to date by re-reading what we wrote.
-	w.encoder = newFileEncoder(newF.File, 0)
-	// Actually, since the encoder was writing sequentially and we reopened,
-	// we need to seek to end and create a fresh encoder at the right offset.
+	// Create encoder on the new file at the right offset.
 	off, err := newF.Seek(0, io.SeekEnd)
 	if err != nil {
 		return nil, err
