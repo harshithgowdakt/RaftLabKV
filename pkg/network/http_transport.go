@@ -63,6 +63,12 @@ func (t *Transport) send(m raft.Message) {
 		return
 	}
 
+	// Normalize addresses like ":8080" to "localhost:8080" so the
+	// URL has a valid host component.
+	if len(addr) > 0 && addr[0] == ':' {
+		addr = "localhost" + addr
+	}
+
 	data, err := json.Marshal(m)
 	if err != nil {
 		log.Printf("transport: marshal error: %v", err)

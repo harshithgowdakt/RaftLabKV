@@ -46,7 +46,7 @@ func main() {
 	}
 
 	if *dataDir == "" {
-		*dataDir = fmt.Sprintf("/tmp/raft-%d", *id)
+		*dataDir = fmt.Sprintf("data/raft-%d", *id)
 	}
 
 	// Parse peers.
@@ -153,7 +153,14 @@ func main() {
 			cfg.Applied = ents[len(ents)-1].Index
 		}
 
-		// 7. Restart raft node.
+		// 7. Set peer list so the progress tracker is populated on restart.
+		var peerIDs []uint64
+		for pid := range peerMap {
+			peerIDs = append(peerIDs, pid)
+		}
+		storage.SetPeers(peerIDs)
+
+		// 8. Restart raft node.
 		node = raft.RestartNode(cfg)
 
 		// 8. Open bbolt KV store.

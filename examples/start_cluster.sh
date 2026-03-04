@@ -14,17 +14,17 @@ PEERS="1=:8080,2=:8081,3=:8082"
 
 # Start node1 (port 8080)
 echo "Starting node1 on :8080..."
-./bin/server -id=1 -addr=:8080 -peers=$PEERS -data-dir=/tmp/raft-1 &
+./bin/server -id=1 -addr=:8080 -peers=$PEERS &
 NODE1_PID=$!
 
 # Start node2 (port 8081)
 echo "Starting node2 on :8081..."
-./bin/server -id=2 -addr=:8081 -peers=$PEERS -data-dir=/tmp/raft-2 &
+./bin/server -id=2 -addr=:8081 -peers=$PEERS &
 NODE2_PID=$!
 
 # Start node3 (port 8082)
 echo "Starting node3 on :8082..."
-./bin/server -id=3 -addr=:8082 -peers=$PEERS -data-dir=/tmp/raft-3 &
+./bin/server -id=3 -addr=:8082 -peers=$PEERS &
 NODE3_PID=$!
 
 echo "Cluster started!"

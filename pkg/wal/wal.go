@@ -139,25 +139,11 @@ func Create(dir string, metadata []byte) (*WAL, error) {
 		return nil, err
 	}
 
-	// Close the old locked file BEFORE re-opening at the new path.
-	// On macOS, flock(LOCK_EX) blocks even within the same process
-	// if a different fd holds an exclusive lock on the same inode.
-	w.locks[0].Close()
-
-	// Re-open the file with the final path for the lock.
-	newPath := filepath.Join(dir, walName(0, 0))
-	newF, err := fileutil.LockFile(newPath, os.O_WRONLY|os.O_APPEND, fileutil.PrivateFileMode)
-	if err != nil {
-		return nil, err
-	}
-	w.locks[0] = newF
-
-	// Create encoder on the new file at the right offset.
-	off, err := newF.Seek(0, io.SeekEnd)
-	if err != nil {
-		return nil, err
-	}
-	w.encoder = newEncoder(newF.File, 0, int(off)%walPageBytes)
+	// After os.Rename, the original fd (and its flock) remain valid on
+	// Unix — the inode hasn't changed, only the directory entry moved.
+	// Keep using the existing LockedFile and encoder to preserve the
+	// running CRC chain. Only filepath.Base(f.Name()) is used later
+	// (for WAL name parsing), which is unchanged by the dir rename.
 
 	// Open directory handle.
 	w.dirFile, err = os.Open(dir)
@@ -385,12 +371,14 @@ func (w *WAL) Save(st raft.HardState, ents []raft.Entry) error {
 		return fmt.Errorf("wal: sync: %w", err)
 	}
 
-	// Check segment rotation.
-	info, err := curFile.Stat()
+	// Check segment rotation using actual write offset, not file size.
+	// Files are pre-allocated to SegmentSizeBytes, so Stat().Size()
+	// would always equal SegmentSizeBytes and trigger rotation on every Save.
+	curOff, err := curFile.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return err
 	}
-	if info.Size() < SegmentSizeBytes {
+	if curOff < SegmentSizeBytes {
 		return nil
 	}
 	return w.cut()

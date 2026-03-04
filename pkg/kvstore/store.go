@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/harshithgowdakt/raftlabkv/pkg/raft"
 	bolt "go.etcd.io/bbolt"
@@ -122,11 +123,19 @@ func (kv *KVStore) propose(op Operation) error {
 		kv.pendingMu.Unlock()
 	}()
 
-	if err := kv.node.Propose(context.TODO(), data); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := kv.node.Propose(ctx, data); err != nil {
 		return fmt.Errorf("propose failed: %w", err)
 	}
 
-	return <-ch
+	select {
+	case err := <-ch:
+		return err
+	case <-ctx.Done():
+		return fmt.Errorf("proposal timed out: no leader or quorum unavailable")
+	}
 }
 
 // ApplyCommitted applies committed entries from the raft log to the

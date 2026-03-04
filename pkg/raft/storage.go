@@ -140,6 +140,14 @@ func (ms *MemoryStorage) firstIndex() uint64 {
 	return ms.ents[0].Index + 1
 }
 
+// SetPeers sets the peer list in the snapshot metadata. This is needed
+// during recovery so that newRaft can populate the progress tracker.
+func (ms *MemoryStorage) SetPeers(peers []uint64) {
+	ms.Lock()
+	defer ms.Unlock()
+	ms.snapshot.Metadata.Peers = peers
+}
+
 // Snapshot implements the Storage interface.
 func (ms *MemoryStorage) Snapshot() (Snapshot, error) {
 	ms.Lock()
