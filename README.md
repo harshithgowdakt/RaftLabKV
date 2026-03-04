@@ -1,33 +1,66 @@
 # RaftLabKV: Distributed Key-Value Store with Raft Consensus
 
-A simple distributed key-value store implementation using the Raft consensus algorithm, similar to etcd but simplified for educational purposes.
+A distributed key-value store built from scratch using the Raft consensus algorithm, modeled after etcd's architecture. Implements etcd-style binary WAL, bbolt-backed persistent storage, and binary snapshots with CRC integrity.
 
-> Developed using Claude Code and Codex.
-> Not recommended for production use.
+> **Disclaimer:** This project was developed with AI assistance (Claude Code and Codex). It is intended for **learning and educational purposes only** and is **not recommended for production use cases**.
 
 ## Architecture
 
-The system consists of several key components:
+```
+┌─────────────────────────────────────────────────┐
+│                   HTTP Server                    │
+│         /kv/put  /kv/get  /kv/delete             │
+├─────────────────────────────────────────────────┤
+│                   KV Store (bbolt)               │
+│            Applies committed entries             │
+├─────────────────────────────────────────────────┤
+│                 Raft Consensus                   │
+│     Leader Election · Log Replication            │
+│     PreVote · CheckQuorum · ReadIndex            │
+├─────────────────────────────────────────────────┤
+│              HTTP Transport Layer                │
+│           /raft/message (peer RPCs)              │
+├─────────────────────────────────────────────────┤
+│                Persistence Layer                 │
+│    WAL (binary, CRC)  ·  Snapshots (binary)      │
+│    File Locking  ·  Pre-allocation  ·  Purging   │
+└─────────────────────────────────────────────────┘
+```
 
-- **Raft Layer**: Handles consensus, leader election, and log replication
-- **Key-Value Store**: Applies committed operations to maintain consistent state
-- **Network Layer**: HTTP-based communication between nodes
-- **Client Interface**: Simple API for interacting with the cluster
+### On-Disk Layout
+
+```
+{data-dir}/member/
+├── wal/
+│   ├── 0000000000000000-0000000000000000.wal   # Binary segmented WAL files
+│   └── ...
+└── snap/
+    ├── db                                       # bbolt database (persistent KV state)
+    └── 0000000000000001-0000000000000002.snap   # Binary snapshot files
+```
 
 ## Features
 
-- **Consensus**: Raft algorithm ensures consistency across nodes
-- **Leader Election**: Automatic leader election with configurable timeouts
-- **Log Replication**: Reliable replication of operations across the cluster
-- **REST API**: HTTP endpoints for both Raft and KV operations
-- **Client Library**: Simple client for interacting with the cluster
+- **Raft Consensus** — Full implementation with leader election, log replication, PreVote, and CheckQuorum
+- **etcd-Style Binary WAL** — Protobuf-encoded records, CRC-32C integrity chains, 64 MB pre-allocated segments
+- **Persistent KV Store** — bbolt (B+ tree embedded database) for durable key-value storage
+- **Binary Snapshots** — CRC-protected snapshot files with automatic compaction
+- **Crash Recovery** — WAL replay from last snapshot point, torn write detection, WAL repair
+- **File Pipeline** — Background goroutine pre-allocates next WAL segment for fast rotation
+- **File Purging** — Automatic cleanup of old WAL and snapshot files
+- **Graceful Shutdown** — Context-based cancellation with `sync.WaitGroup` across all goroutines
+- **REST API** — HTTP endpoints for KV operations and cluster status
+- **Interactive Client** — CLI client with auto leader discovery
 
 ## Quick Start
 
-### Build the Project
+### Prerequisites
+
+- Go 1.24+
+
+### Build
 
 ```bash
-# Build server and client binaries
 go build -o bin/server ./cmd/server
 go build -o bin/client ./cmd/client
 ```
@@ -35,114 +68,182 @@ go build -o bin/client ./cmd/client
 ### Start a 3-Node Cluster
 
 ```bash
-# Option 1: Use the provided script
-./examples/start_cluster.sh
+# Terminal 1
+./bin/server -id=1 -addr=:8080 -peers=1=:8080,2=:8081,3=:8082 -data-dir=/tmp/raft-1
 
-# Option 2: Start nodes manually
-./bin/server -id=node1 -addr=:8080 -peers=localhost:8081,localhost:8082 &
-./bin/server -id=node2 -addr=:8081 -peers=localhost:8080,localhost:8082 &
-./bin/server -id=node3 -addr=:8082 -peers=localhost:8080,localhost:8081 &
+# Terminal 2
+./bin/server -id=2 -addr=:8081 -peers=1=:8080,2=:8081,3=:8082 -data-dir=/tmp/raft-2
+
+# Terminal 3
+./bin/server -id=3 -addr=:8082 -peers=1=:8080,2=:8081,3=:8082 -data-dir=/tmp/raft-3
 ```
 
 ### Use the Client
 
 ```bash
-# Interactive client
 ./bin/client localhost:8080,localhost:8081,localhost:8082
 
-# Example commands:
 > put name Alice
 > put age 25
 > get name
 > getall
 > delete age
+> status localhost:8080
 > exit
 ```
 
-### Test the Cluster
+### Use curl
 
 ```bash
-./examples/test_cluster.sh
+# Write a key
+curl -X POST localhost:8080/kv/put -d '{"key":"name","value":"Alice"}'
+
+# Read a key (from any node)
+curl localhost:8081/kv/get/name
+
+# Delete a key
+curl -X DELETE localhost:8080/kv/delete/name
+
+# Get all keys
+curl localhost:8080/kv/all
+
+# Check node status
+curl localhost:8080/status
 ```
+
+### Verify Persistence
+
+```bash
+# Write some data, then kill a node (Ctrl+C)
+# Restart the same node — data survives via WAL recovery:
+./bin/server -id=1 -addr=:8080 -peers=1=:8080,2=:8081,3=:8082 -data-dir=/tmp/raft-1
+# Node logs: "Recovering from existing WAL..."
+
+# Inspect on-disk files:
+ls -la /tmp/raft-1/member/wal/
+ls -la /tmp/raft-1/member/snap/
+```
+
+## Server Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-id` | (required) | Node ID (must be > 0) |
+| `-addr` | `:8080` | HTTP listen address |
+| `-peers` | (required) | Comma-separated `id=addr` pairs |
+| `-data-dir` | `/tmp/raft-{id}` | Directory for persistent data |
 
 ## API Endpoints
 
-### Key-Value Operations
-- `GET /kv/get/{key}` - Get a value by key
-- `POST /kv/put` - Put a key-value pair
-- `DELETE /kv/delete/{key}` - Delete a key
-- `GET /kv/all` - Get all key-value pairs
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/kv/get/{key}` | GET | Get value by key |
+| `/kv/put` | POST | Put key-value pair (JSON body: `{"key":"...","value":"..."}`) |
+| `/kv/delete/{key}` | DELETE | Delete a key |
+| `/kv/all` | GET | Get all key-value pairs |
+| `/status` | GET | Node status (term, leader, commit/applied index) |
+| `/raft/message` | POST | Raft peer-to-peer messages (internal) |
 
-### Cluster Status
-- `GET /status` - Get node status (term, leader info)
+## Project Structure
 
-### Raft Internal (used by nodes)
-- `POST /raft/requestVote` - Request vote for leader election
-- `POST /raft/appendEntries` - Append entries / heartbeat
+```
+cmd/
+├── server/main.go          Main server entry point, Ready/Advance loop
+└── client/main.go          Interactive CLI client
 
-## Architecture Details
+pkg/
+├── raft/                   Core Raft consensus engine
+│   ├── raft.go             State machine (follower/candidate/leader transitions)
+│   ├── node.go             Node interface with channel-based event loop
+│   ├── rawnode.go           Low-level RawNode API
+│   ├── log.go              Raft log management
+│   ├── log_unstable.go      Unstable (not yet persisted) log entries
+│   ├── storage.go          MemoryStorage implementation
+│   ├── config.go           Raft configuration
+│   ├── types.go            Messages, entries, hard/soft state, snapshots
+│   ├── tracker.go          Follower progress tracking
+│   ├── read_only.go        Linearizable read handling
+│   ├── status.go           Status reporting
+│   ├── logger.go           Logging
+│   └── util.go             Helpers
+│
+├── wal/                    etcd-style Write-Ahead Log
+│   ├── wal.go              Create, Open, Save, ReadAll, cut (segment rotation)
+│   ├── encoder.go          Protobuf record encoding, CRC-32C, frame format
+│   ├── decoder.go          Multi-segment decoding, torn write detection
+│   ├── pagewriter.go       4096-byte page-aligned buffered writer
+│   ├── file_pipeline.go    Background segment pre-allocation
+│   ├── repair.go           WAL recovery from corruption
+│   ├── util.go             Segment naming and parsing
+│   └── walpb/              Protobuf definitions (Record, Snapshot)
+│
+├── snap/
+│   └── snapshotter.go      Binary snapshot files with CRC integrity
+│
+├── kvstore/
+│   └── store.go            bbolt-backed KV store (state machine)
+│
+├── network/
+│   ├── server.go           HTTP server with graceful shutdown
+│   └── http_transport.go   HTTP transport for Raft RPCs
+│
+├── fileutil/
+│   ├── fileutil.go         Directory reading, file validation
+│   ├── lock.go             File locking (flock)
+│   ├── preallocate.go      Disk pre-allocation
+│   └── purge.go            Periodic old file cleanup
+│
+└── client/
+    └── client.go           HTTP client with leader auto-discovery
+```
 
-### Raft Implementation
+## How It Works
 
-The Raft implementation includes:
+### Write Path
 
-1. **Leader Election**: Nodes start as followers, become candidates during elections
-2. **Log Replication**: Leaders replicate log entries to followers
-3. **Safety**: Only committed entries are applied to the state machine
+1. Client sends `PUT` request to any node
+2. If not leader, request is rejected (client retries on leader)
+3. Leader proposes entry through Raft (`node.Propose()`)
+4. Raft replicates entry to followers via `MsgApp` messages
+5. Once a quorum acknowledges, the entry is committed
+6. The `Ready` struct delivers committed entries to the application
+7. Application persists entries to WAL (`w.Save()`)
+8. Application applies committed entries to bbolt KV store
+9. Application calls `node.Advance()` to signal completion
 
-### Key Components
+### Recovery Path
 
-- `pkg/raft/`: Core Raft implementation
-  - `node.go`: Main Raft node logic
-  - `election.go`: Leader election algorithms
-  - `replication.go`: Log replication and heartbeats
-  - `types.go`: Data structures and interfaces
+1. Load latest snapshot from `member/snap/`
+2. Open WAL from the snapshot point (`wal.Open()`)
+3. Replay all WAL records (`w.ReadAll()`) to get hard state + entries
+4. Populate `MemoryStorage` with snapshot, hard state, and entries
+5. Restore bbolt KV state from snapshot data (if any)
+6. Restart Raft node (`raft.RestartNode()`)
 
-- `pkg/kvstore/`: Key-value store implementation
-  - `store.go`: State machine that applies Raft log entries
+### Snapshot Triggering
 
-- `pkg/network/`: Network communication
-  - `server.go`: HTTP server handling requests
-  - `http_transport.go`: HTTP transport for Raft RPCs
+Every 10,000 committed entries:
+1. Copy bbolt database via `tx.WriteTo()` for a consistent snapshot
+2. Save snapshot file to `member/snap/`
+3. Write snapshot marker to WAL
+4. Release locks on old WAL segments
+5. Compact MemoryStorage to free old entries
 
-- `pkg/client/`: Client library
-  - `client.go`: Client for interacting with the cluster
+## Dependencies
 
-### Testing
-
-You can test various scenarios:
-
-1. **Basic Operations**: Put/Get/Delete operations
-2. **Leader Election**: Stop the leader and observe re-election
-3. **Network Partitions**: Simulate network failures
-4. **Data Consistency**: Verify data consistency across nodes
-
-## Understanding Raft
-
-This implementation demonstrates key Raft concepts:
-
-1. **Term**: Logical clock that increases during elections
-2. **Log Index**: Position of entries in the replicated log
-3. **Commit Index**: Index of the highest committed log entry
-4. **Majority Quorum**: Operations require majority of nodes
+| Dependency | Purpose |
+|------------|---------|
+| [bbolt](https://github.com/etcd-io/bbolt) | Embedded B+ tree database for persistent KV storage |
+| [protobuf](https://pkg.go.dev/google.golang.org/protobuf) | WAL record serialization |
 
 ## Limitations
 
-This is a simplified implementation for educational purposes:
+- No TLS or authentication
+- No dynamic membership changes (cluster size fixed at startup)
+- No client-side read consistency (reads served from local bbolt, may be stale on followers)
+- Basic HTTP transport (no connection pooling or streaming)
+- Single-bucket KV model (no ranges, watches, or transactions)
 
-- No persistent storage (data lost on restart)
-- Basic HTTP transport (no TLS, authentication)
-- Simple conflict resolution
-- No membership changes
-- No log compaction/snapshots
+## License
 
-## Next Steps
-
-To make this production-ready, consider adding:
-
-- Persistent storage for logs and state
-- TLS encryption and authentication  
-- Log compaction and snapshots
-- Dynamic membership changes
-- Better error handling and monitoring
-- Performance optimizations
+This project is for educational purposes.

@@ -1,45 +1,63 @@
 #!/bin/bash
 
 # Test script for the distributed key-value store
+# Assumes a 3-node cluster is already running on ports 8080, 8081, 8082
 
-SERVERS="localhost:8080,localhost:8081,localhost:8082"
+set -e
 
 echo "Testing distributed key-value store..."
-
-# Build the client
-go build -o bin/client ./cmd/client
-
-# Function to run client command
-run_cmd() {
-    echo "$ $1"
-    echo "$1" | ./bin/client $SERVERS
-    echo ""
-}
-
-echo "1. Checking cluster status..."
-curl -s http://localhost:8080/status | jq .
-curl -s http://localhost:8081/status | jq .
-curl -s http://localhost:8082/status | jq .
 echo ""
 
-echo "2. Testing basic operations..."
-run_cmd "put name Alice"
-run_cmd "put age 25"
-run_cmd "put city NewYork"
+echo "1. Checking cluster status..."
+echo "--- Node 1 ---"
+curl -s http://localhost:8080/status | python3 -m json.tool 2>/dev/null || curl -s http://localhost:8080/status
+echo ""
+echo "--- Node 2 ---"
+curl -s http://localhost:8081/status | python3 -m json.tool 2>/dev/null || curl -s http://localhost:8081/status
+echo ""
+echo "--- Node 3 ---"
+curl -s http://localhost:8082/status | python3 -m json.tool 2>/dev/null || curl -s http://localhost:8082/status
+echo ""
 
-echo "3. Reading values..."
-run_cmd "get name"
-run_cmd "get age"
-run_cmd "get city"
+sleep 1
+
+echo "2. Writing key-value pairs..."
+curl -s -X POST localhost:8080/kv/put -d '{"key":"name","value":"Alice"}'
+echo ""
+curl -s -X POST localhost:8080/kv/put -d '{"key":"age","value":"25"}'
+echo ""
+curl -s -X POST localhost:8080/kv/put -d '{"key":"city","value":"NewYork"}'
+echo ""
+
+sleep 1
+
+echo "3. Reading values from different nodes..."
+echo "--- get name (from node 1) ---"
+curl -s localhost:8080/kv/get/name
+echo ""
+echo "--- get age (from node 2) ---"
+curl -s localhost:8081/kv/get/age
+echo ""
+echo "--- get city (from node 3) ---"
+curl -s localhost:8082/kv/get/city
+echo ""
 
 echo "4. Getting all data..."
-run_cmd "getall"
+curl -s localhost:8080/kv/all | python3 -m json.tool 2>/dev/null || curl -s localhost:8080/kv/all
+echo ""
 
 echo "5. Deleting a key..."
-run_cmd "delete age"
+curl -s -X DELETE localhost:8080/kv/delete/age
+echo ""
+
+sleep 1
 
 echo "6. Verifying deletion..."
-run_cmd "get age"
-run_cmd "getall"
+echo "--- get age (should be 404) ---"
+curl -s -w "\nHTTP %{http_code}\n" localhost:8080/kv/get/age
+echo ""
+echo "--- getall (age should be gone) ---"
+curl -s localhost:8080/kv/all | python3 -m json.tool 2>/dev/null || curl -s localhost:8080/kv/all
+echo ""
 
 echo "Test completed!"
